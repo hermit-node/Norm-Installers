@@ -21,7 +21,7 @@ from typing import Any, Callable, Iterable
 
 import installer_environment as envtools
 
-INSTALLER_VERSION = "1.6.9-unified"
+INSTALLER_VERSION = "1.6.10-unified"
 PIP_VERSION = "26.2.1"
 PIP_MIN_VERSION = PIP_VERSION  # backward-compatible internal print helper
 PIP_SPEC = f"pip=={PIP_VERSION}"
@@ -219,13 +219,20 @@ def _replace_plugin_src(source_folder: Path, destination: Path) -> None:
         raise
 
 
-def _copy_plugin_metadata(source_folder: Path, destination: Path) -> None:
+def _copy_plugin_metadata(source_folder: Path, destination: Path) -> list[str]:
     """Refresh small Norm-owned plugin metadata after src/ has passed its target hash."""
     destination.mkdir(parents=True, exist_ok=True)
+    changed: list[str] = []
     for name in ("plugin.json", "README.md"):
         src = Path(source_folder) / name
-        if src.is_file():
-            shutil.copy2(src, destination / name)
+        dst = destination / name
+        if not src.is_file():
+            continue
+        if dst.is_file() and dst.read_bytes() == src.read_bytes():
+            continue
+        shutil.copy2(src, dst)
+        changed.append(name)
+    return changed
 
 
 def _reconcile_public_plugins(
@@ -241,8 +248,9 @@ def _reconcile_public_plugins(
 
     Order is deliberately read-before-write:
       1. Hash installed src/ against the release's trusted Schema-2 SHA.
-      2. If it already matches, do nothing.
-      3. If it differs, replace only src/ from the verified packaged Norm adapter and re-hash.
+      2. If it already matches, leave src/ untouched and refresh only trusted small metadata
+         (plugin.json/README.md) when those files differ.
+      3. If src differs, replace only src/ from the verified packaged Norm adapter and re-hash.
       4. Only if that still fails, fetch the pinned public release, verify it against the same
          trusted identity, replace src/ from that public copy, and re-hash again.
 
@@ -331,8 +339,12 @@ def _reconcile_public_plugins(
                 log(f"Managed plugin {rel} cannot be hashed ({exc}); repair required.")
 
             if installed_sha == expected_sha:
+                metadata_changed = _copy_plugin_metadata(packaged_folder, destination)
                 verified += 1
-                log(f"Managed plugin {rel}: src SHA verified; no write required.")
+                if metadata_changed:
+                    log(f"Managed plugin {rel}: src SHA verified and untouched; refreshed metadata: {', '.join(metadata_changed)}.")
+                else:
+                    log(f"Managed plugin {rel}: src SHA and metadata already verified; no write required.")
                 continue
 
             log(
@@ -743,7 +755,13 @@ def _snapshot_existing_config(target: Path, log: LogFn) -> Path | None:
         candidate = target / "backups" / f"installer-config-{stamp}-{suffix}"
         suffix += 1
     shutil.copytree(config_dir, candidate)
-    log(f"Snapshotted existing config for rollback: {candidate}")
+    snapshots = sorted(
+        (p for p in (target / "backups").glob("installer-config-*") if p.is_dir()),
+        key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True,
+    )
+    for stale in snapshots[12:]:
+        shutil.rmtree(stale, ignore_errors=True)
+    log(f"Snapshotted existing config for rollback: {candidate} (retaining newest 12 installer snapshots)")
     return candidate
 
 
@@ -1541,19 +1559,17 @@ DEFAULT_IMPRINT: dict[str, Any] = {
         "redis_host": "loopback",
         "redis_port": 6379,
     },
-    "model_provider": {
-        "chat_base_url": "http://127.0.0.1:8080/v1",
-        "primary_model": "",
-        "secondary_model": "",
-        "embedding_base_url": "http://127.0.0.1:11434/v1",
-        "embedding_model": "nomic-embed-text",
-        "timeout_seconds": 180,
-    },
-    "remote_agents": {
-        "jan_enabled": False, "jan_scheme": "http", "jan_host": "", "jan_port": 1337, "jan_model": "primary",
-        "vane_enabled": False, "vane_scheme": "http", "vane_host": "", "vane_port": 7789,
-        "opencode_enabled": False, "opencode_scheme": "http", "opencode_host": "", "opencode_port": 4096,
-        "opencode_username": "opencode", "opencode_provider_id": "norm-shared", "opencode_model": "primary", "opencode_fallback_model": "secondary",
+    "plugin_settings": {
+        "model_provider": {
+            "enabled": False, "chat_base_url": "", "primary_model": "", "secondary_model": "",
+            "embedding_base_url": "", "embedding_model": "", "timeout_seconds": 180,
+        },
+        "jan": {"enabled": False, "scheme": "http", "host": "", "port": 1337, "model": "primary"},
+        "vane": {"enabled": False, "scheme": "http", "host": "", "port": 7789},
+        "opencode": {
+            "enabled": False, "scheme": "http", "host": "", "port": 4096, "username": "opencode",
+            "provider_id": "norm-shared", "model": "primary", "fallback_model": "secondary",
+        },
     },
     "postgres": {
         "user": "norm",
@@ -1772,6 +1788,43 @@ def _update_env_file(path: Path, updates: dict[str, str], *, require_password: b
         pass
 
 
+def _write_plugin_settings_ini(target: Path, plugin_settings: dict[str, Any], log: LogFn) -> None:
+    """Persist installer-edited plugin values separately from core settings.ini.
+
+    The runtime plugin reconciler remains authoritative for schema/defaults. The installer
+    updates only declared remote/model sections and preserves unrelated plugin sections.
+    """
+    path = target / "config" / "plugins.ini"
+    parser = configparser.ConfigParser(interpolation=None)
+    if path.is_file():
+        parser.read(path, encoding="utf-8-sig")
+    for section in ("model_provider", "jan", "vane", "opencode"):
+        values = plugin_settings.get(section) or {}
+        if not isinstance(values, dict):
+            continue
+        if not parser.has_section(section):
+            parser.add_section(section)
+        for key, value in values.items():
+            if isinstance(value, bool):
+                text = "true" if value else "false"
+            else:
+                text = str(value)
+            parser.set(section, str(key), text)
+    # If this is a completely unconfigured fresh install, leave plugins.ini creation to
+    # PluginManager.refresh(); that preserves pre-0.53.20 behavior until Norm actually starts.
+    any_enabled = any(bool((plugin_settings.get(section) or {}).get("enabled")) for section in ("model_provider", "jan", "vane", "opencode"))
+    if not path.is_file() and not any_enabled:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".installer-writing")
+    with temp.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write("# Norm plugin settings. Plugin manifests define defaults/schema; runtime refresh reconciles this file.\n")
+        handle.write("# Secrets remain in the configured Norm secrets file.\n\n")
+        parser.write(handle, space_around_delimiters=True)
+    os.replace(temp, path)
+    log(f"Applied plugin settings to {path}; runtime hot-refresh will fill defaults and prune dangling keys/sections.")
+
+
 def _apply_imprint(
     target: Path,
     manifest: dict[str, Any],
@@ -1801,19 +1854,7 @@ def _apply_imprint(
     for key in ("ollama_port", "norm_port", "activity_port", "postgres_port", "redis_port"):
         _set_ini_value(settings_path, "network", key, str(_coerce_port(network[key], f"network.{key}")))
 
-    model_provider = data.get("model_provider", {})
-    for key in ("chat_base_url", "primary_model", "secondary_model", "embedding_base_url", "embedding_model"):
-        _set_ini_value(settings_path, "model_provider", key, str(model_provider.get(key, "")))
-    _set_ini_value(settings_path, "model_provider", "timeout_seconds", str(_coerce_positive_int(model_provider.get("timeout_seconds", 180), "model_provider.timeout_seconds", 1, 900)))
-
-    remote_agents = data.get("remote_agents", {})
-    for name in ("jan", "vane", "opencode"):
-        _set_ini_value(settings_path, "remote_agents", f"{name}_enabled", _bool_text(remote_agents.get(f"{name}_enabled", False)))
-        _set_ini_value(settings_path, "remote_agents", f"{name}_scheme", str(remote_agents.get(f"{name}_scheme", "http") or "http"))
-        _set_ini_value(settings_path, "remote_agents", f"{name}_host", str(remote_agents.get(f"{name}_host", "")))
-        _set_ini_value(settings_path, "remote_agents", f"{name}_port", str(_coerce_port(remote_agents.get(f"{name}_port"), f"remote_agents.{name}_port")))
-    for key in ("jan_model", "opencode_username", "opencode_provider_id", "opencode_model", "opencode_fallback_model"):
-        _set_ini_value(settings_path, "remote_agents", key, str(remote_agents.get(key, "")))
+    _write_plugin_settings_ini(target, data.get("plugin_settings", {}), log)
 
     ssh = data["ssh"]
     _set_ini_value(settings_path, "ssh", "enabled", _bool_text(ssh["enabled"]))
@@ -2188,31 +2229,32 @@ def launch_gui(initial_source: Path | None = None, imprint_path: Path | None = N
     ssh_port_var = tk.StringVar(value=str(nested_get(imprint, "ssh.port", 22)))
     ssh_identity_var = tk.StringVar(value=str(nested_get(imprint, "ssh.identity_file", "norm_remote_ed25519")))
 
-    model_chat_url_var = tk.StringVar(value=str(nested_get(imprint, "model_provider.chat_base_url", "http://127.0.0.1:8080/v1")))
-    model_primary_var = tk.StringVar(value=str(nested_get(imprint, "model_provider.primary_model", "")))
-    model_secondary_var = tk.StringVar(value=str(nested_get(imprint, "model_provider.secondary_model", "")))
-    model_embed_url_var = tk.StringVar(value=str(nested_get(imprint, "model_provider.embedding_base_url", "http://127.0.0.1:11434/v1")))
-    model_embed_var = tk.StringVar(value=str(nested_get(imprint, "model_provider.embedding_model", "nomic-embed-text")))
-    model_timeout_var = tk.StringVar(value=str(nested_get(imprint, "model_provider.timeout_seconds", 180)))
+    model_enabled_var = tk.BooleanVar(value=bool(nested_get(imprint, "plugin_settings.model_provider.enabled", False)))
+    model_chat_url_var = tk.StringVar(value=str(nested_get(imprint, "plugin_settings.model_provider.chat_base_url", "")))
+    model_primary_var = tk.StringVar(value=str(nested_get(imprint, "plugin_settings.model_provider.primary_model", "")))
+    model_secondary_var = tk.StringVar(value=str(nested_get(imprint, "plugin_settings.model_provider.secondary_model", "")))
+    model_embed_url_var = tk.StringVar(value=str(nested_get(imprint, "plugin_settings.model_provider.embedding_base_url", "")))
+    model_embed_var = tk.StringVar(value=str(nested_get(imprint, "plugin_settings.model_provider.embedding_model", "")))
+    model_timeout_var = tk.StringVar(value=str(nested_get(imprint, "plugin_settings.model_provider.timeout_seconds", 180)))
     model_api_key_var = tk.StringVar(value="")
     embed_api_key_var = tk.StringVar(value="")
 
-    jan_enabled_var = tk.BooleanVar(value=bool(nested_get(imprint, "remote_agents.jan_enabled", False)))
-    jan_host_var = tk.StringVar(value=str(nested_get(imprint, "remote_agents.jan_host", "")))
-    jan_port_var = tk.StringVar(value=str(nested_get(imprint, "remote_agents.jan_port", 1337)))
-    jan_model_var = tk.StringVar(value=str(nested_get(imprint, "remote_agents.jan_model", "primary")))
+    jan_enabled_var = tk.BooleanVar(value=bool(nested_get(imprint, "plugin_settings.jan.enabled", False)))
+    jan_host_var = tk.StringVar(value=str(nested_get(imprint, "plugin_settings.jan.host", "")))
+    jan_port_var = tk.StringVar(value=str(nested_get(imprint, "plugin_settings.jan.port", 1337)))
+    jan_model_var = tk.StringVar(value=str(nested_get(imprint, "plugin_settings.jan.model", "primary")))
     jan_api_key_var = tk.StringVar(value="")
-    vane_enabled_var = tk.BooleanVar(value=bool(nested_get(imprint, "remote_agents.vane_enabled", False)))
-    vane_host_var = tk.StringVar(value=str(nested_get(imprint, "remote_agents.vane_host", "")))
-    vane_port_var = tk.StringVar(value=str(nested_get(imprint, "remote_agents.vane_port", 7789)))
+    vane_enabled_var = tk.BooleanVar(value=bool(nested_get(imprint, "plugin_settings.vane.enabled", False)))
+    vane_host_var = tk.StringVar(value=str(nested_get(imprint, "plugin_settings.vane.host", "")))
+    vane_port_var = tk.StringVar(value=str(nested_get(imprint, "plugin_settings.vane.port", 7789)))
     vane_token_var = tk.StringVar(value="")
-    opencode_enabled_var = tk.BooleanVar(value=bool(nested_get(imprint, "remote_agents.opencode_enabled", False)))
-    opencode_host_var = tk.StringVar(value=str(nested_get(imprint, "remote_agents.opencode_host", "")))
-    opencode_port_var = tk.StringVar(value=str(nested_get(imprint, "remote_agents.opencode_port", 4096)))
-    opencode_username_var = tk.StringVar(value=str(nested_get(imprint, "remote_agents.opencode_username", "opencode")))
-    opencode_provider_var = tk.StringVar(value=str(nested_get(imprint, "remote_agents.opencode_provider_id", "norm-shared")))
-    opencode_model_var = tk.StringVar(value=str(nested_get(imprint, "remote_agents.opencode_model", "primary")))
-    opencode_fallback_var = tk.StringVar(value=str(nested_get(imprint, "remote_agents.opencode_fallback_model", "secondary")))
+    opencode_enabled_var = tk.BooleanVar(value=bool(nested_get(imprint, "plugin_settings.opencode.enabled", False)))
+    opencode_host_var = tk.StringVar(value=str(nested_get(imprint, "plugin_settings.opencode.host", "")))
+    opencode_port_var = tk.StringVar(value=str(nested_get(imprint, "plugin_settings.opencode.port", 4096)))
+    opencode_username_var = tk.StringVar(value=str(nested_get(imprint, "plugin_settings.opencode.username", "opencode")))
+    opencode_provider_var = tk.StringVar(value=str(nested_get(imprint, "plugin_settings.opencode.provider_id", "norm-shared")))
+    opencode_model_var = tk.StringVar(value=str(nested_get(imprint, "plugin_settings.opencode.model", "primary")))
+    opencode_fallback_var = tk.StringVar(value=str(nested_get(imprint, "plugin_settings.opencode.fallback_model", "secondary")))
     opencode_password_var = tk.StringVar(value="")
 
     selected_source: Path | None = initial_source.resolve() if initial_source else None
@@ -2462,25 +2504,27 @@ def launch_gui(initial_source: Path | None = None, imprint_path: Path | None = N
         wraplength=760,
     ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
-    shared_box = ttk.LabelFrame(agents_tab, text="Shared model endpoints", padding=8)
+    shared_box = ttk.LabelFrame(agents_tab, text="Shared model provider", padding=8)
     shared_box.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
     shared_box.columnconfigure(1, weight=1)
-    add_entry(shared_box, 0, "Chat API base URL", model_chat_url_var, "model_provider.chat_base_url", width=48)
-    add_entry(shared_box, 1, "Primary model", model_primary_var, "model_provider.primary_model", width=48)
-    add_entry(shared_box, 2, "Secondary model (optional)", model_secondary_var, "model_provider.secondary_model", width=48)
-    add_entry(shared_box, 3, "Embedding API base URL", model_embed_url_var, "model_provider.embedding_base_url", width=48)
-    add_entry(shared_box, 4, "Embedding model", model_embed_var, "model_provider.embedding_model", width=48)
-    add_entry(shared_box, 5, "Timeout seconds", model_timeout_var, "model_provider.timeout_seconds", width=12)
-    ttk.Label(shared_box, text="Chat API key (optional)").grid(row=6, column=0, sticky="w", padx=(0,8), pady=4)
-    ttk.Entry(shared_box, textvariable=model_api_key_var, show="•").grid(row=6, column=1, sticky="ew", pady=4)
-    ttk.Label(shared_box, text="[secret]", width=11).grid(row=6, column=2, sticky="w", padx=(8,0))
-    ttk.Label(shared_box, text="Embedding API key (optional)").grid(row=7, column=0, sticky="w", padx=(0,8), pady=4)
-    ttk.Entry(shared_box, textvariable=embed_api_key_var, show="•").grid(row=7, column=1, sticky="ew", pady=4)
+    ttk.Checkbutton(shared_box, text="Enable shared model provider", variable=model_enabled_var, command=lambda: mark_entered("plugin_settings.model_provider.enabled")).grid(row=0,column=1,sticky="w",pady=(0,4))
+    add_entry(shared_box, 1, "Chat API base URL", model_chat_url_var, "plugin_settings.model_provider.chat_base_url", width=48)
+    add_entry(shared_box, 2, "Primary model", model_primary_var, "plugin_settings.model_provider.primary_model", width=48)
+    add_entry(shared_box, 3, "Secondary model (optional)", model_secondary_var, "plugin_settings.model_provider.secondary_model", width=48)
+    add_entry(shared_box, 4, "Embedding API base URL", model_embed_url_var, "plugin_settings.model_provider.embedding_base_url", width=48)
+    add_entry(shared_box, 5, "Embedding model", model_embed_var, "plugin_settings.model_provider.embedding_model", width=48)
+    add_entry(shared_box, 6, "Timeout seconds", model_timeout_var, "plugin_settings.model_provider.timeout_seconds", width=12)
+    ttk.Label(shared_box, text="Chat API key (optional)").grid(row=7, column=0, sticky="w", padx=(0,8), pady=4)
+    ttk.Entry(shared_box, textvariable=model_api_key_var, show="•").grid(row=7, column=1, sticky="ew", pady=4)
     ttk.Label(shared_box, text="[secret]", width=11).grid(row=7, column=2, sticky="w", padx=(8,0))
+    ttk.Label(shared_box, text="Embedding API key (optional)").grid(row=8, column=0, sticky="w", padx=(0,8), pady=4)
+    ttk.Entry(shared_box, textvariable=embed_api_key_var, show="•").grid(row=8, column=1, sticky="ew", pady=4)
+    ttk.Label(shared_box, text="[secret]", width=11).grid(row=8, column=2, sticky="w", padx=(8,0))
+    ttk.Label(shared_box, text="Leave disabled until the second-PC model service exists; Norm then behaves exactly as before.", wraplength=760).grid(row=9,column=0,columnspan=3,sticky="w",pady=(5,0))
 
     jan_box = ttk.LabelFrame(agents_tab, text="Jan", padding=8)
     jan_box.grid(row=1, column=0, sticky="nsew", padx=(0,6), pady=4)
-    ttk.Checkbutton(jan_box, text="Enable", variable=jan_enabled_var, command=lambda: mark_entered("remote_agents.jan_enabled")).grid(row=0,column=0,sticky="w")
+    ttk.Checkbutton(jan_box, text="Enable", variable=jan_enabled_var, command=lambda: mark_entered("plugin_settings.jan.enabled")).grid(row=0,column=0,sticky="w")
     ttk.Label(jan_box,text="Host").grid(row=1,column=0,sticky="w"); ttk.Entry(jan_box,textvariable=jan_host_var,width=27).grid(row=1,column=1,sticky="ew")
     ttk.Label(jan_box,text="Port").grid(row=2,column=0,sticky="w"); ttk.Entry(jan_box,textvariable=jan_port_var,width=9).grid(row=2,column=1,sticky="w")
     ttk.Label(jan_box,text="Model/role").grid(row=3,column=0,sticky="w"); ttk.Entry(jan_box,textvariable=jan_model_var,width=20).grid(row=3,column=1,sticky="ew")
@@ -2489,7 +2533,7 @@ def launch_gui(initial_source: Path | None = None, imprint_path: Path | None = N
 
     vane_box = ttk.LabelFrame(agents_tab, text="Vane", padding=8)
     vane_box.grid(row=1, column=1, sticky="nsew", padx=6, pady=4)
-    ttk.Checkbutton(vane_box, text="Enable", variable=vane_enabled_var, command=lambda: mark_entered("remote_agents.vane_enabled")).grid(row=0,column=0,sticky="w")
+    ttk.Checkbutton(vane_box, text="Enable", variable=vane_enabled_var, command=lambda: mark_entered("plugin_settings.vane.enabled")).grid(row=0,column=0,sticky="w")
     ttk.Label(vane_box,text="Host").grid(row=1,column=0,sticky="w"); ttk.Entry(vane_box,textvariable=vane_host_var,width=27).grid(row=1,column=1,sticky="ew")
     ttk.Label(vane_box,text="Port").grid(row=2,column=0,sticky="w"); ttk.Entry(vane_box,textvariable=vane_port_var,width=9).grid(row=2,column=1,sticky="w")
     ttk.Label(vane_box,text="Bearer token").grid(row=3,column=0,sticky="w"); ttk.Entry(vane_box,textvariable=vane_token_var,show="•").grid(row=3,column=1,sticky="ew")
@@ -2498,7 +2542,7 @@ def launch_gui(initial_source: Path | None = None, imprint_path: Path | None = N
 
     oc_box = ttk.LabelFrame(agents_tab, text="OpenCode", padding=8)
     oc_box.grid(row=1, column=2, sticky="nsew", padx=(6,0), pady=4)
-    ttk.Checkbutton(oc_box, text="Enable", variable=opencode_enabled_var, command=lambda: mark_entered("remote_agents.opencode_enabled")).grid(row=0,column=0,sticky="w")
+    ttk.Checkbutton(oc_box, text="Enable", variable=opencode_enabled_var, command=lambda: mark_entered("plugin_settings.opencode.enabled")).grid(row=0,column=0,sticky="w")
     ttk.Label(oc_box,text="Host").grid(row=1,column=0,sticky="w"); ttk.Entry(oc_box,textvariable=opencode_host_var,width=27).grid(row=1,column=1,sticky="ew")
     ttk.Label(oc_box,text="Port").grid(row=2,column=0,sticky="w"); ttk.Entry(oc_box,textvariable=opencode_port_var,width=9).grid(row=2,column=1,sticky="w")
     ttk.Label(oc_box,text="Username").grid(row=3,column=0,sticky="w"); ttk.Entry(oc_box,textvariable=opencode_username_var).grid(row=3,column=1,sticky="ew")
@@ -2540,22 +2584,23 @@ def launch_gui(initial_source: Path | None = None, imprint_path: Path | None = N
             "runtime.storage_context.primary_name": storage_primary_name_var,
             "runtime.storage_context.primary_root": storage_primary_root_var,
             "runtime.storage_context.backup_name": storage_backup_name_var,
-            "model_provider.chat_base_url": model_chat_url_var, "model_provider.primary_model": model_primary_var,
-            "model_provider.secondary_model": model_secondary_var, "model_provider.embedding_base_url": model_embed_url_var,
-            "model_provider.embedding_model": model_embed_var, "model_provider.timeout_seconds": model_timeout_var,
-            "remote_agents.jan_host": jan_host_var, "remote_agents.jan_port": jan_port_var, "remote_agents.jan_model": jan_model_var,
-            "remote_agents.vane_host": vane_host_var, "remote_agents.vane_port": vane_port_var,
-            "remote_agents.opencode_host": opencode_host_var, "remote_agents.opencode_port": opencode_port_var,
-            "remote_agents.opencode_username": opencode_username_var, "remote_agents.opencode_provider_id": opencode_provider_var,
-            "remote_agents.opencode_model": opencode_model_var, "remote_agents.opencode_fallback_model": opencode_fallback_var,
+            "plugin_settings.model_provider.chat_base_url": model_chat_url_var, "plugin_settings.model_provider.primary_model": model_primary_var,
+            "plugin_settings.model_provider.secondary_model": model_secondary_var, "plugin_settings.model_provider.embedding_base_url": model_embed_url_var,
+            "plugin_settings.model_provider.embedding_model": model_embed_var, "plugin_settings.model_provider.timeout_seconds": model_timeout_var,
+            "plugin_settings.jan.host": jan_host_var, "plugin_settings.jan.port": jan_port_var, "plugin_settings.jan.model": jan_model_var,
+            "plugin_settings.vane.host": vane_host_var, "plugin_settings.vane.port": vane_port_var,
+            "plugin_settings.opencode.host": opencode_host_var, "plugin_settings.opencode.port": opencode_port_var,
+            "plugin_settings.opencode.username": opencode_username_var, "plugin_settings.opencode.provider_id": opencode_provider_var,
+            "plugin_settings.opencode.model": opencode_model_var, "plugin_settings.opencode.fallback_model": opencode_fallback_var,
         }
         for dotted, var in scalar_vars.items():
             var.set(str(envtools.nested_get(resolved, dotted, "")))
         require_tailscale_var.set(bool(envtools.nested_get(resolved, "network.require_tailscale", False)))
         ssh_enabled_var.set(bool(envtools.nested_get(resolved, "ssh.enabled", False)))
-        jan_enabled_var.set(bool(envtools.nested_get(resolved, "remote_agents.jan_enabled", False)))
-        vane_enabled_var.set(bool(envtools.nested_get(resolved, "remote_agents.vane_enabled", False)))
-        opencode_enabled_var.set(bool(envtools.nested_get(resolved, "remote_agents.opencode_enabled", False)))
+        model_enabled_var.set(bool(envtools.nested_get(resolved, "plugin_settings.model_provider.enabled", False)))
+        jan_enabled_var.set(bool(envtools.nested_get(resolved, "plugin_settings.jan.enabled", False)))
+        vane_enabled_var.set(bool(envtools.nested_get(resolved, "plugin_settings.vane.enabled", False)))
+        opencode_enabled_var.set(bool(envtools.nested_get(resolved, "plugin_settings.opencode.enabled", False)))
         allowed_roots_var.set(";".join(str(x) for x in (envtools.nested_get(resolved, "runtime.allowed_roots", []) or [])))
         never_probe_patterns_var.set(";".join(str(x) for x in (envtools.nested_get(resolved, "runtime.network_map.never_probe_name_patterns", []) or [])))
         never_probe_cidrs_var.set(";".join(str(x) for x in (envtools.nested_get(resolved, "runtime.network_map.never_probe_cidrs", []) or [])))
@@ -2606,20 +2651,21 @@ def launch_gui(initial_source: Path | None = None, imprint_path: Path | None = N
                 "redis_host": redis_host_var.get().strip(),
                 "redis_port": _coerce_port(redis_port_var.get(), "Redis port"),
             },
-            "model_provider": {
-                "chat_base_url": model_chat_url_var.get().strip(),
-                "primary_model": model_primary_var.get().strip(),
-                "secondary_model": model_secondary_var.get().strip(),
-                "embedding_base_url": model_embed_url_var.get().strip(),
-                "embedding_model": model_embed_var.get().strip(),
-                "timeout_seconds": _coerce_positive_int(model_timeout_var.get(), "Model timeout seconds", 1, 900),
-            },
-            "remote_agents": {
-                "jan_enabled": bool(jan_enabled_var.get()), "jan_scheme": "http", "jan_host": jan_host_var.get().strip(), "jan_port": _coerce_port(jan_port_var.get(), "Jan port"), "jan_model": jan_model_var.get().strip() or "primary",
-                "vane_enabled": bool(vane_enabled_var.get()), "vane_scheme": "http", "vane_host": vane_host_var.get().strip(), "vane_port": _coerce_port(vane_port_var.get(), "Vane port"),
-                "opencode_enabled": bool(opencode_enabled_var.get()), "opencode_scheme": "http", "opencode_host": opencode_host_var.get().strip(), "opencode_port": _coerce_port(opencode_port_var.get(), "OpenCode port"),
-                "opencode_username": opencode_username_var.get().strip() or "opencode", "opencode_provider_id": opencode_provider_var.get().strip() or "norm-shared",
-                "opencode_model": opencode_model_var.get().strip() or "primary", "opencode_fallback_model": opencode_fallback_var.get().strip() or "secondary",
+            "plugin_settings": {
+                "model_provider": {
+                    "enabled": bool(model_enabled_var.get()),
+                    "chat_base_url": model_chat_url_var.get().strip(), "primary_model": model_primary_var.get().strip(),
+                    "secondary_model": model_secondary_var.get().strip(), "embedding_base_url": model_embed_url_var.get().strip(),
+                    "embedding_model": model_embed_var.get().strip(),
+                    "timeout_seconds": _coerce_positive_int(model_timeout_var.get(), "Model timeout seconds", 1, 900),
+                },
+                "jan": {"enabled": bool(jan_enabled_var.get()), "scheme": "http", "host": jan_host_var.get().strip(), "port": _coerce_port(jan_port_var.get(), "Jan port"), "model": jan_model_var.get().strip() or "primary"},
+                "vane": {"enabled": bool(vane_enabled_var.get()), "scheme": "http", "host": vane_host_var.get().strip(), "port": _coerce_port(vane_port_var.get(), "Vane port")},
+                "opencode": {
+                    "enabled": bool(opencode_enabled_var.get()), "scheme": "http", "host": opencode_host_var.get().strip(), "port": _coerce_port(opencode_port_var.get(), "OpenCode port"),
+                    "username": opencode_username_var.get().strip() or "opencode", "provider_id": opencode_provider_var.get().strip() or "norm-shared",
+                    "model": opencode_model_var.get().strip() or "primary", "fallback_model": opencode_fallback_var.get().strip() or "secondary",
+                },
             },
             "postgres": {
                 "user": pg_user_var.get().strip(),
@@ -2654,8 +2700,12 @@ def launch_gui(initial_source: Path | None = None, imprint_path: Path | None = N
         for key in ("user", "database", "schema", "stocks_database"):
             if not data["postgres"][key]:
                 raise InstallerError(f"PostgreSQL {key.replace('_', ' ')} is required.")
+        plugin_cfg = data.get("plugin_settings", {})
+        if (plugin_cfg.get("model_provider") or {}).get("enabled") and not str((plugin_cfg.get("model_provider") or {}).get("chat_base_url") or "").strip():
+            raise InstallerError("Shared model provider is enabled but Chat API base URL is blank.")
         for name in ("jan", "vane", "opencode"):
-            if data["remote_agents"].get(f"{name}_enabled") and not str(data["remote_agents"].get(f"{name}_host") or "").strip():
+            section = plugin_cfg.get(name) or {}
+            if section.get("enabled") and not str(section.get("host") or "").strip():
                 raise InstallerError(f"{name.title()} is enabled but its host is blank.")
         return validate_imprint(data)
 

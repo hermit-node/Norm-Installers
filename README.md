@@ -1,63 +1,73 @@
-# Norm Installer 1.6.9 (Unified)
+# Norm Installer 1.6.10 (Unified)
 
-**Commit:** not in git history — recovered from the build workspace
-**Source:** `D:\LOCAL_Share\Code Projects\n_temp\Norm-build-0.53.20\installer-1.6.9-build`
-**Files:** Norm-Installer.py, installer_environment.py, Norm-Installer.spec
-**Lines:** 3092 | **Schema:** 1
-**SHA-256 (Norm-Installer.py):** `e410b1b8a9042096b991d90ab4e4b6453dee1453774bedc6f5e54414742263bf`
+**Commit:** `cc8753e` — Norm 0.53.20 (current HEAD)
+**Files:** Norm-Installer.py, installer_environment.py, Build-Installer.bat, Build-Installer.py, Run-Installer.bat, Norm-Installer.spec, norm-imprint.example.json
+**Lines:** 3142 | **Classes:** 4 | **Functions:** 69
+**Schema:** 1
 
 ## What this is
 
-The one version the archive was missing. The `installer_manifest.md` in
-`n_temp\installer_versions` states it plainly: **"1.6.3 and 1.6.9 do not
-exist in git history."** This folder fills the 1.6.9 gap. It sits exactly
-between 1.6.8 and 1.6.10 in size and line count:
-
-| Version | Norm-Installer.py | Lines |
-|---------|-------------------|-------|
-| 1.6.8   | 117,989 B         | 2646  |
-| **1.6.9** | **148,600 B**   | **3092** |
-| 1.6.10  | 151,554 B         | 3142  |
-
-So 1.6.9 is a real, distinct iteration — not a version-string-only
-duplicate of its neighbours. It carries most of the growth that 1.6.10
-finishes off, but predates 1.6.10's PyInstaller-spec build-system rewrite.
+**Completely different build system.** The old Build-Norm-Installer-EXE.bat
+and Run-Norm-Installer.bat are replaced by Build-Installer.bat +
+Build-Installer.py + Norm-Installer.spec (PyInstaller spec-based build).
+Gains 496 lines and 7 functions over 1.6.8.
 
 ## Build & Run
 
-- **Norm-Installer.spec** — PyInstaller specification (715 bytes, same size
-  as 1.6.10's). Present here, so the spec-based build was already in play
-  by 1.6.9.
-- The build workspace also shipped a compiled `dist/Norm-Installer.exe`
-  (12.5 MB) and PyInstaller `build/` intermediates; those are build
-  outputs, not source, so they are not copied into this version folder.
+- **Build-Installer.bat** — new entry point (176 bytes)
+- **Build-Installer.py** — PyInstaller spec-based build (1,101 bytes)
+- **Norm-Installer.spec** — PyInstaller specification (715 bytes)
+- **Run-Installer.bat** — new run script (398 bytes)
 
 ## Unique to this version
 
-- **1.6.9-unified** — the missing middle step between 1.6.8 and 1.6.10.
-- **~30,600 bytes / ~446 lines larger than 1.6.8** — a substantial code
-  addition, not a relabel.
-- **installer_environment.py at 16,569 B** — larger than 1.6.8's 12,449 B
-  and smaller than 1.6.10's 18,686 B, again a genuine intermediate state.
-- **Norm-Installer.spec present** — the spec-based build was already
-  established before 1.6.10's full build-system rename.
-- **Patch lineage preserved in the build workspace** — three generations of
-  diff patches (`apply169` / `final169` / `real169` and their `*_env169`
-  counterparts) plus `selftest.txt` / `installer-selftest.txt` /
-  `exe-selftest.txt` markers document how this build was assembled and
-  verified.
+- **PyInstaller spec-based build** — Norm-Installer.spec (NEW)
+- **Build-Installer.py** — dedicated build script (NEW)
+- **Build-Installer.bat / Run-Installer.bat** — renamed from old .bat files
+- **Schema-2 plugin support** — `_schema2_plugin_src_hash`, `_verify_schema2_plugin_folder`
+- **Plugin source verification** — SHA-256 hash of plugin src/ trees
+- **Second-PC configuration** — remote model integrations (opt-in)
+- **plugins.ini reconciliation** — manifest-driven plugin settings
+- **Config snapshots** — retained to max 12
+- **External .env** — secrets remain in configured external .env
+- +7 functions, +496 lines over 1.6.8
+- **142 plugin-related code references** (vs 4 in 1.6.6–1.6.8)
 
 ## Regressions vs later versions
 
-- Lacks 1.6.10's renamed build entry points (`Build-Installer.bat` /
-  `Build-Installer.py` / `Run-Installer.bat`) — those arrive in 1.6.10.
-- No `norm-imprint.example.json` in this folder (present in 1.6.10).
+- None — this is the current HEAD
 
-## Provenance note
+## Progressions vs 1.6.8
 
-This folder was created by copying the three source files out of the
-`Norm-build-0.53.20` build workspace, which is the only surviving copy of
-the 1.6.9-unified installer. The workspace's `.diff` patch files, `.b64`
-encodings, `dist/` EXE, and `build/` intermediates were left in place as
-build artifacts; only the canonical source files are archived here,
-matching the layout of the other version folders.
+- +7 functions, +496 lines
+- +PyInstaller spec-based build
+- +Schema-2 plugin support
+- +Second-PC / remote model configuration
+- +plugins.ini reconciliation
+- +Config snapshots (max 12)
+- +External .env for secrets
+
+## Variant note: the old "Installer 1.6.10" folder
+
+A stray folder named `Installer 1.6.10` (with a `README.txt`) used to sit
+beside this one. It was **not** a different code variant:
+
+- `Norm-Installer.py` and `installer_environment.py` are **byte-identical
+  after normalizing line endings** (the stray copy used LF, this folder uses
+  CRLF). SHA-256 differs only because of the line-ending bytes.
+- Both copies declare `INSTALLER_VERSION = "1.6.10-unified"` (line 24).
+- The stray copy had no .bat files, no `.spec`, no `Build-Installer.py`, and
+  no `plugins/` folder — it was a partial drop of the same 1.6.10-unified
+  source.
+
+Its `README.txt` claimed "Target package: Norm 0.53.21" and recorded a
+Windows-built EXE:
+
+- `C:\Users\KHzz\Downloads\Norm-Installer-1.6.10.exe`
+- SHA-256: `8A23A8A93FD45A3EF72BF3F4E6735A333C3973E76825B2A91597527B7CDA80BE`
+
+That EXE was built from this same 1.6.10-unified source; the "0.53.21"
+target label was the package it was pointed at at build time (the installer
+code itself carries no hardcoded target version — it installs whatever
+source it is given). The stray folder has been merged into this one and
+deleted, so this folder is the single canonical home for installer 1.6.10.
