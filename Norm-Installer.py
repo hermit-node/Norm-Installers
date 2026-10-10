@@ -21,7 +21,7 @@ from typing import Any, Callable, Iterable
 
 import installer_environment as envtools
 
-INSTALLER_VERSION = "1.6.10-unified"
+INSTALLER_VERSION = "1.6.15"
 PIP_VERSION = "26.2.1"
 PIP_MIN_VERSION = PIP_VERSION  # backward-compatible internal print helper
 PIP_SPEC = f"pip=={PIP_VERSION}"
@@ -1208,6 +1208,93 @@ def _restore_full_backup_state(package_root: Path, target: Path, settings: confi
         _run(cmd, cwd=target, log=log, env=env)
 
 
+def _ingest_operator_plugins(
+    target: Path,
+    *,
+    log: LogFn,
+    warnings: list[str],
+) -> None:
+    """Extract operator-supplied plugin ZIPs from the installer's plugins/ folder.
+
+    The installer's working directory (the folder containing Norm-Installer.py
+    or the built EXE) may contain a ``plugins/`` subfolder. Any ``.zip`` files
+    placed there are extracted into the installation target's ``plugins/``
+    directory during install. This lets the operator bundle specific plugins
+    without including them in the main Norm source portable ZIP.
+
+    ZIP layout handling:
+      - If the ZIP contains a single top-level directory, that directory is
+        extracted directly into ``target/plugins/`` (it becomes the plugin folder).
+      - If the ZIP is flat (no single top-level directory), its contents are
+        extracted into ``target/plugins/<zip_stem>/``.
+
+    Path-traversal members are rejected. Existing files are overwritten so
+    that re-running the installer with updated plugin ZIPs refreshes the
+    installed copy.
+    """
+    if hasattr(sys, "_MEIPASS"):
+        base_dir = Path(sys.executable).parent
+    else:
+        base_dir = Path(__file__).resolve().parent
+
+    # The build drops the EXE into dist/ (see Build-Installer.py), while the
+    # plugins/ folder lives in the installer source folder one level up.
+    # Check both so the feature works whether the EXE is run from dist/ or
+    # moved next to plugins/.
+    plugins_src = None
+    for candidate in (base_dir, base_dir.parent):
+        candidate_plugins = candidate / "plugins"
+        if candidate_plugins.is_dir():
+            plugins_src = candidate_plugins
+            break
+    if plugins_src is None:
+        return
+
+    zips = sorted(plugins_src.glob("*.zip"))
+    if not zips:
+        log("No operator plugin ZIPs found in plugins/ folder.")
+        return
+
+    target_plugins = target / "plugins"
+    target_plugins.mkdir(parents=True, exist_ok=True)
+
+    for zip_path in zips:
+        log(f"Installing operator plugin from {zip_path.name}")
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                names = zf.namelist()
+                if not names:
+                    warnings.append(f"Plugin ZIP {zip_path.name} is empty; skipped.")
+                    continue
+
+                # Validate all members for path traversal.
+                for member in names:
+                    member_path = Path(member)
+                    if member_path.is_absolute() or ".." in member_path.parts:
+                        raise InstallerError(
+                            f"Unsafe path in plugin ZIP {zip_path.name}: {member!r}"
+                        )
+
+                # Detect single top-level directory.
+                top_dirs = {n.split("/", 1)[0] for n in names if n and not n.startswith("/")}
+                top_dirs.discard("")
+                if len(top_dirs) == 1:
+                    dest = target_plugins
+                    log(f"  Single top-level folder '{top_dirs.pop()}' -> {dest}")
+                else:
+                    dest = target_plugins / zip_path.stem
+                    log(f"  Flat/multi-root -> {dest}")
+
+                dest.mkdir(parents=True, exist_ok=True)
+                zf.extractall(dest)
+                log(f"  Extracted {len(names)} entries from {zip_path.name}")
+        except InstallerError:
+            raise
+        except Exception as exc:
+            warnings.append(f"Failed to install operator plugin {zip_path.name}: {exc}")
+            log(f"  WARNING: {exc}")
+
+
 def install_norm(
     options: InstallOptions,
     *,
@@ -1292,6 +1379,7 @@ def install_norm(
             log=log,
             warnings=warnings,
         )
+        _ingest_operator_plugins(target, log=log, warnings=warnings)
         log(
             "Sync summary: "
             f"{stats['added']} added, {stats['updated']} updated, "
