@@ -1,37 +1,30 @@
-# Norm Installer 1.6.6 (Unified)
+# Norm Installer 1.6.7 (Unified)
 
-**Commit:** `e22d7ad` — Norm 0.53.14
+**Commit:** `40703ec` — Norm 0.53.16 (private)
 **Files:** Norm-Installer.py, installer_environment.py, Build-Norm-Installer-EXE.bat, Run-Norm-Installer.bat, norm-imprint.example.json
-**Lines:** 2585 | **Classes:** 4 | **Functions:** 61
+**Lines:** 2618 | **Classes:** 4 | **Functions:** 62
 **Schema:** 1
 
 ## What this is
 
-**First appearance of `installer_environment.py`** (12,448 bytes). This
-extracts environment-specific logic (connection strings, paths, service
-configuration) out of the main installer into a dedicated module. Also adds
-migration support.
+Modest step up from 1.6.6. +1 function, +33 lines. installer_environment.py
+grows by 1 byte (12,449 vs 12,448).
 
 ## Build & Run
 
-- Same as 1.6.0–1.6.5
+- Same as 1.6.0–1.6.6
 
 ## Unique to this version
 
-- **installer_environment.py** — NEW dedicated environment module
-- **Migration support** — database schema migrations
-- +1 function, +184 lines over 1.6.5
-- Norm 0.53.14 target
-- Full documentation suite (AUDIT.md, PUBLISH.md, RELEASE.md, SECURITY.md)
+- +1 function, +33 lines over 1.6.6
+- Norm 0.53.16 private
+- README-FIRST.txt appears (new documentation file)
 
 ## Regressions vs later versions
 
-- No plugin handling
-- No headless mode
-- No PyInstaller spec (arrives 1.6.10)
+- Same as 1.6.6
 
-## Progressions vs 1.6.5
+## Progressions vs 1.6.6
 
-- +installer_environment.py (major architectural change)
-- +migration support
-- +1 function, +184 lines
+- +1 function, +33 lines
+- Norm target bumped to 0.53.16
