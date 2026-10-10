@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
-INSTALLER_VERSION = "1.6.4-unified"
+INSTALLER_VERSION = "1.6.5-unified"
 PIP_VERSION = "26.2.1"
 PIP_MIN_VERSION = PIP_VERSION  # backward-compatible internal print helper
 PIP_SPEC = f"pip=={PIP_VERSION}"
@@ -433,7 +433,7 @@ def _overlay_existing_settings(package_settings: Path, old_settings: Path, *, pa
                 _set_ini_value(package_settings, section, key, value)
     # Release identity/runtime binding are package-owned, not operator preferences.
     _set_ini_value(package_settings, "project", "version", package_version)
-    log("Preserved existing settings.ini verbatim and added newly introduced 0.53.10 keys.")
+    log("Preserved existing settings.ini verbatim and added newly introduced 0.53.11 keys.")
 
 
 def _merge_existing_json(package_path: Path, old_path: Path, log: LogFn) -> None:
