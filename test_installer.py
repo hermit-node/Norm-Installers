@@ -165,7 +165,7 @@ secrets_file = {secrets_path.as_posix()}
     assert "current_machine = imprinted-host" in installed_settings
     assert "postgres_port = 55432" in installed_settings
 
-assert m.INSTALLER_VERSION == "1.6.2-unified"
+assert m.INSTALLER_VERSION == "1.6.4-unified"
 assert "imprint" in m.InstallOptions.__dataclass_fields__
 assert "secret_values" in m.InstallOptions.__dataclass_fields__
 
@@ -174,4 +174,45 @@ print("PASS: companion SHA verification/rejection")
 print("PASS: imprint merge and save")
 print("PASS: secret-like imprint keys rejected")
 print("PASS: secret values separated from imprint/log")
-print("PASS: installer version 1.6.2")
+print("PASS: installer version 1.6.4")
+
+
+with tempfile.TemporaryDirectory() as td_name:
+    td = Path(td_name)
+    target = td / "Norm"
+    config = target / "config"
+    config.mkdir(parents=True)
+    (config / "settings.ini").write_text(
+        "[project]\nversion = 0.53.9\n\n[worker]\ncustom = keep-me\n\n[paths]\nruntime_root = C:\\\\OldNorm\n",
+        encoding="utf-8",
+    )
+    (config / "runtime.json").write_text(json.dumps({"worker": {"poll_ms": 1234}, "custom": {"keep": True}}), encoding="utf-8")
+    (config / "network-map.json").write_text(json.dumps({"schema": 1, "targets": [{"name": "custom-target", "host": "example.invalid"}]}), encoding="utf-8")
+    (config / "custom-sidecar.json").write_text(json.dumps({"hello": "world"}), encoding="utf-8")
+    snap = m._snapshot_existing_config(target, lambda _: None)
+    assert snap is not None
+
+    # Simulate package mirror output.
+    (config / "settings.ini").write_text(
+        "[project]\nversion = 0.53.10\n\n[paths]\nruntime_root = .\n\n[new_section]\nnew_key = default\n",
+        encoding="utf-8",
+    )
+    (config / "runtime.json").write_text(json.dumps({"worker": {"poll_ms": 5000, "task_round_limit": 128}, "new": 1}), encoding="utf-8")
+    (config / "network-map.json").write_text(json.dumps({"schema": 1, "targets": []}), encoding="utf-8")
+    (config / "custom-sidecar.json").unlink(missing_ok=True)
+    m._restore_operator_config(target, snap, package_version="0.53.10", log=lambda _: None)
+
+    settings_text = (config / "settings.ini").read_text(encoding="utf-8")
+    assert "version = 0.53.10" in settings_text
+    assert "custom = keep-me" in settings_text
+    assert "new_key = default" in settings_text
+    runtime = json.loads((config / "runtime.json").read_text(encoding="utf-8"))
+    assert runtime["worker"]["poll_ms"] == 1234
+    assert runtime["worker"]["task_round_limit"] == 128
+    assert runtime["new"] == 1
+    assert runtime["custom"]["keep"] is True
+    net = json.loads((config / "network-map.json").read_text(encoding="utf-8"))
+    assert net["targets"][0]["name"] == "custom-target"
+    assert json.loads((config / "custom-sidecar.json").read_text(encoding="utf-8"))["hello"] == "world"
+
+print("PASS: in-place config snapshot and merge preservation")

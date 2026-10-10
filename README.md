@@ -1,29 +1,32 @@
-# Norm Installer 1.6.2 (Unified)
+# Norm Installer 1.6.4 (Unified)
 
-**Commit:** `a5a76de` — Norm 0.53.10 (private staging)
+**Commit:** `2abd5df` — Norm 0.53.10 (private)
 **Files:** Norm-Installer.py, Build-Norm-Installer-EXE.bat, Run-Norm-Installer.bat, norm-imprint.example.json
-**Lines:** 2317 | **Classes:** 4 | **Functions:** 56
+**Lines:** 2401 | **Classes:** 4 | **Functions:** 60
 **Schema:** 1
 
 ## What this is
 
-Same line count as 1.6.1 (2317) but 3 bytes smaller in Norm-Installer.py.
-Minor changes only. Norm 0.53.10 private staging.
+Gains 84 lines and 4 functions over 1.6.2. The test suite grows
+(test_installer.py: 8,056 bytes vs 5,838 in 1.6.0).
 
 ## Build & Run
 
-- Same as 1.6.0/1.6.1
+- Same as 1.6.0–1.6.2
 
 ## Unique to this version
 
-- Norm 0.53.10 private staging
-- -3 bytes vs 1.6.1 (likely a version string or comment change)
+- +4 functions, +84 lines over 1.6.2
+- Expanded test suite
+- Norm 0.53.10 private
 
 ## Regressions vs later versions
 
-- Same as 1.6.1
+- No `installer_environment.py` (arrives 1.6.6)
+- No plugin handling
+- No headless mode
 
-## Progressions vs 1.6.1
+## Progressions vs 1.6.2
 
-- Norm target bumped to 0.53.10
-- Minor byte-level changes
+- +4 functions, +84 lines
+- Test suite expanded ~2.2 KB

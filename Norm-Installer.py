@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
-INSTALLER_VERSION = "1.6.2-unified"
+INSTALLER_VERSION = "1.6.4-unified"
 PIP_VERSION = "26.2.1"
 PIP_MIN_VERSION = PIP_VERSION  # backward-compatible internal print helper
 PIP_SPEC = f"pip=={PIP_VERSION}"
@@ -396,6 +396,84 @@ def _has_protected_descendant(rel: str, protected: set[str]) -> bool:
     return False
 
 
+
+def _snapshot_existing_config(target: Path, log: LogFn) -> Path | None:
+    """Persist a rollback copy of operator config before an in-place package sync."""
+    config_dir = target / "config"
+    if not config_dir.is_dir():
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup_root = target / "backups" / f"installer-config-{stamp}"
+    candidate = backup_root
+    suffix = 1
+    while candidate.exists():
+        candidate = target / "backups" / f"installer-config-{stamp}-{suffix}"
+        suffix += 1
+    shutil.copytree(config_dir, candidate)
+    log(f"Snapshotted existing config for rollback: {candidate}")
+    return candidate
+
+
+def _overlay_existing_settings(package_settings: Path, old_settings: Path, *, package_version: str, log: LogFn) -> None:
+    """Preserve the operator's INI verbatim, adding only newly introduced package keys."""
+    if not old_settings.is_file() or not package_settings.is_file():
+        return
+    new_parser = configparser.ConfigParser(interpolation=None)
+    old_parser = configparser.ConfigParser(interpolation=None)
+    with package_settings.open("r", encoding="utf-8-sig") as handle:
+        new_parser.read_file(handle)
+    with old_settings.open("r", encoding="utf-8-sig") as handle:
+        old_parser.read_file(handle)
+
+    # Restore the human-edited file first so comments/order/custom formatting survive.
+    shutil.copy2(old_settings, package_settings)
+    for section in new_parser.sections():
+        for key, value in new_parser.items(section, raw=True):
+            if not old_parser.has_option(section, key):
+                _set_ini_value(package_settings, section, key, value)
+    # Release identity/runtime binding are package-owned, not operator preferences.
+    _set_ini_value(package_settings, "project", "version", package_version)
+    log("Preserved existing settings.ini verbatim and added newly introduced 0.53.10 keys.")
+
+
+def _merge_existing_json(package_path: Path, old_path: Path, log: LogFn) -> None:
+    """Recursively preserve existing JSON values while retaining newly introduced defaults."""
+    if not old_path.is_file():
+        return
+    if not package_path.exists():
+        package_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(old_path, package_path)
+        log(f"Restored operator JSON config not present in package: {package_path.name}")
+        return
+    try:
+        new_value = json.loads(package_path.read_text(encoding="utf-8-sig"))
+        old_value = json.loads(old_path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        raise InstallerError(f"Could not merge JSON config {package_path}: {exc}") from exc
+    if isinstance(new_value, dict) and isinstance(old_value, dict):
+        merged = _deep_merge(new_value, old_value)
+    else:
+        # For non-object JSON, an explicit existing operator value wins wholesale.
+        merged = old_value
+    package_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+    log(f"Merged existing JSON values into {package_path.name}; new package keys retained.")
+
+
+def _restore_operator_config(target: Path, snapshot: Path | None, *, package_version: str, log: LogFn) -> None:
+    if snapshot is None or not snapshot.is_dir():
+        return
+    config_dir = target / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    old_settings = snapshot / "settings.ini"
+    current_settings = config_dir / "settings.ini"
+    _overlay_existing_settings(current_settings, old_settings, package_version=package_version, log=log)
+
+    # Merge every prior JSON config. This covers norm.json/runtime.json/network-map.json
+    # plus any operator-added JSON sidecars that the package does not know about yet.
+    for old_json in sorted(snapshot.rglob("*.json")):
+        rel = old_json.relative_to(snapshot)
+        _merge_existing_json(config_dir / rel, old_json, log)
+
 def _sync_tree_contents(
     source_root: Path,
     target: Path,
@@ -751,9 +829,12 @@ def install_norm(
             ".norm-install-state.json",
         }
 
+        config_snapshot = _snapshot_existing_config(target, log) if target_nonempty else None
+
         progress(20, "Synchronizing Norm files")
         ignore_source = {"backup-state", "SENSITIVE_BACKUP.txt"} if staged_info.manifest.get("package_type") == "full-backup" else set()
         stats = _sync_tree_contents(extracted_root, target, protected=protected, log=log, ignore_source_roots=ignore_source)
+        _restore_operator_config(target, config_snapshot, package_version=staged_info.version, log=log)
         for subtree in staged_info.manifest.get("managed_persistent_subtrees", []) or []:
             rel = _norm_rel(Path(str(subtree)))
             src_subtree = extracted_root.joinpath(*PurePosixPath(rel).parts)
@@ -782,13 +863,16 @@ def install_norm(
         # a local sidecar to deterministically bind this installation to its environment.
         installed_manifest_path = target / "package-manifest.json"
         installed_manifest = json.loads(installed_manifest_path.read_text(encoding="utf-8-sig"))
-        _apply_imprint(
-            target,
-            installed_manifest,
-            options.imprint,
-            options.secret_values,
-            log=log,
-        )
+        if target_nonempty:
+            log("Existing Norm installation detected: preserved config remains authoritative; skipping automatic imprint rebind.")
+        else:
+            _apply_imprint(
+                target,
+                installed_manifest,
+                options.imprint,
+                options.secret_values,
+                log=log,
+            )
 
     # From here onward the install operates only on the target copy.
     manifest_path = target / "package-manifest.json"
