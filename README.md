@@ -1,43 +1,30 @@
-# Norm Installer 1.6.0 (Unified)
+# Norm Installer 1.6.1 (Unified)
 
-**Commit:** `0c668b4` — Norm 0.53.9
+**Commit:** `10b03ee` — Norm 0.53.9 (private)
 **Files:** Norm-Installer.py, Build-Norm-Installer-EXE.bat, Run-Norm-Installer.bat, norm-imprint.example.json
-**Lines:** 2291 | **Classes:** 4 | **Functions:** 56
+**Lines:** 2317 | **Classes:** 4 | **Functions:** 56
 **Schema:** 1
 
 ## What this is
 
-A major leap. Gains 675 lines and 12 functions over 1.5.0. Adds Redis,
-Ollama, and imprint handling. The repo layout changes significantly —
-`src/`, `tests/`, `tools/` directories appear, along with `AUDIT.md`,
-`PUBLISH.md`, `RELEASE.md`, `SECURITY.md`, and `SHA256SUMS.txt`.
+A private staging release. Same function count as 1.6.0 but +26 lines.
+The portable-source ZIP is included in the repo (Norm-0.53.9).
 
 ## Build & Run
 
-- **Build-Norm-Installer-EXE.bat** — 1,156 bytes (was 407)
-- **Run-Norm-Installer.bat** — 421 bytes (was 329)
-- **norm-imprint.example.json** — NEW (imprint configuration example)
+- Same as 1.6.0
 
 ## Unique to this version
 
-- **Redis setup** — full Redis/Memurai configuration
-- **Ollama integration** — local model server setup
-- **Imprint handling** — non-secret imprint JSON for identity
-- **norm-imprint.example.json** — example configuration
-- **Repo restructure** — src/, tests/, tools/ directories
-- **AUDIT.md, PUBLISH.md, RELEASE.md, SECURITY.md** — documentation suite
-- +12 functions, +675 lines over 1.5.0
+- **Private staging** — Norm 0.53.9 private build
+- +26 lines over 1.6.0 (minor changes)
+- Portable-source ZIP included in repo
 
 ## Regressions vs later versions
 
-- No `installer_environment.py` (arrives 1.6.6)
-- No `build_source_package.py` (arrives 1.6.0 per manifest but not in git tree)
-- No plugin handling
-- No headless mode
+- Same as 1.6.0
 
-## Progressions vs 1.5.0
+## Progressions vs 1.6.0
 
-- +12 functions, +675 lines
-- +Redis, +Ollama, +imprint
-- Repo restructured with src/tests/tools
-- Documentation suite added
+- +26 lines (minor refinements)
+- Private build channel

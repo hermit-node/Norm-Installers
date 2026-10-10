@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import configparser
@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
-INSTALLER_VERSION = "1.6.0-unified"
+INSTALLER_VERSION = "1.6.1-unified"
 PIP_VERSION = "26.2.1"
 PIP_MIN_VERSION = PIP_VERSION  # backward-compatible internal print helper
 PIP_SPEC = f"pip=={PIP_VERSION}"
@@ -992,6 +992,7 @@ def _source_directory() -> Path:
 
 IMPRINT_SCHEMA_VERSION = 1
 LOCAL_IMPRINT_NAME = "norm-imprint.local.json"
+LOCAL_PRIVATE_DIR = ".norm-local"
 EXAMPLE_IMPRINT_NAME = "norm-imprint.example.json"
 _SECRET_KEY_RE = re.compile(r"(?:password|passwd|pwd|secret|token|authkey|api[_-]?key|private[_-]?key)", re.I)
 
@@ -1327,26 +1328,47 @@ def _peek_norm_source(path: Path) -> tuple[str, str] | None:
 def list_local_sources(directory: Path | None = None) -> list[Path]:
     """Return valid local Norm source ZIPs, highest package version first.
 
-    Every candidate is inspected from its package manifest. Modification time is
-    only a same-version tie-breaker, so copying an older ZIP later cannot make it
-    outrank a newer Norm release.
+    Local operator packages under .norm-local are considered first and win
+    same-version ties. The .norm-local directory is Git-ignored and is never
+    part of the public release bundle.
     """
     root = Path(directory).resolve() if directory else _source_directory()
-    candidates: list[tuple[tuple, int, str, Path]] = []
-    for path in root.glob("*.zip"):
-        if not path.is_file():
-            continue
-        meta = _peek_norm_source(path)
-        if meta is None:
-            continue
-        version, _ = meta
-        try:
-            mtime = path.stat().st_mtime_ns
-        except OSError:
-            mtime = 0
-        candidates.append((_version_key(version), mtime, path.name.lower(), path.resolve()))
-    candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
-    return [item[3] for item in candidates]
+    candidates: list[tuple[tuple, int, int, str, Path]] = []
+
+    search_roots: list[tuple[Path, int]] = []
+    private_root = root / LOCAL_PRIVATE_DIR
+    if private_root.is_dir():
+        search_roots.append((private_root, 1))
+    search_roots.append((root, 0))
+
+    for search_root, private_priority in search_roots:
+        for path in search_root.glob("*.zip"):
+            if not path.is_file():
+                continue
+            meta = _peek_norm_source(path)
+            if meta is None:
+                continue
+            version, _ = meta
+            try:
+                mtime = path.stat().st_mtime_ns
+            except OSError:
+                mtime = 0
+            candidates.append(
+                (
+                    _version_key(version),
+                    private_priority,
+                    mtime,
+                    path.name.lower(),
+                    path.resolve(),
+                )
+            )
+
+    candidates.sort(
+        key=lambda item: (item[0], item[1], item[2], item[3]),
+        reverse=True,
+    )
+    return [item[4] for item in candidates]
+
 
 def find_latest_source(directory: Path | None = None) -> Path | None:
     sources = list_local_sources(directory)
@@ -2001,7 +2023,11 @@ def launch_gui(initial_source: Path | None = None, imprint_path: Path | None = N
             _verify_companion_sha256(selected_source)
             selected_info = inspect_package(selected_source)
             package_var.set(f"{selected_info.label}  •  {selected_source.name}")
-            package_detail_var.set("✓ Highest valid package version found beside installer  •  ✓ SHA-256 verified")
+            package_detail_var.set(
+                "✓ Local private package selected from .norm-local  •  ✓ SHA-256 verified"
+                if LOCAL_PRIVATE_DIR in selected_source.parts
+                else "✓ Highest valid public package version found beside installer  •  ✓ SHA-256 verified"
+            )
             if not python_var.get().strip():
                 default_py = choose_default_python(selected_source)
                 if default_py:
