@@ -51,13 +51,13 @@ def make_pkg(folder: Path, version: str) -> Path:
 with tempfile.TemporaryDirectory() as td_name:
     td = Path(td_name)
     older = make_pkg(td, "0.53.8")
-    newest = make_pkg(td, "0.53.9")
+    newest = make_pkg(td, "0.53.10")
     now = time.time()
     os.utime(newest, (now - 100, now - 100))
     os.utime(older, (now, now))
     found = m.find_latest_source(td)
     assert found == newest
-    assert m.inspect_package(found).version == "0.53.9"
+    assert m.inspect_package(found).version == "0.53.10"
     m._verify_companion_sha256(found)
     newest.write_bytes(newest.read_bytes() + b"x")
     try:
@@ -165,7 +165,7 @@ secrets_file = {secrets_path.as_posix()}
     assert "current_machine = imprinted-host" in installed_settings
     assert "postgres_port = 55432" in installed_settings
 
-assert m.INSTALLER_VERSION == "1.6.0-unified"
+assert m.INSTALLER_VERSION == "1.6.2-unified"
 assert "imprint" in m.InstallOptions.__dataclass_fields__
 assert "secret_values" in m.InstallOptions.__dataclass_fields__
 
@@ -174,4 +174,4 @@ print("PASS: companion SHA verification/rejection")
 print("PASS: imprint merge and save")
 print("PASS: secret-like imprint keys rejected")
 print("PASS: secret values separated from imprint/log")
-print("PASS: installer version 1.6.0")
+print("PASS: installer version 1.6.2")
