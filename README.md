@@ -1,39 +1,38 @@
-# Norm Installer 1.3.6
+# Norm Installer 1.4.0
 
-**Commit:** `a7e504c` — Norm 0.52.3
-**Files:** Norm-Installer.py, Build-Norm-Installer-EXE.bat, Run-Norm-Installer.bat
-**Lines:** 1338 | **Classes:** 4 | **Functions:** 34
+**Commit:** `53d0932` — Norm 0.52.6-pre
+**Files:** Norm-Installer.py, Make-Norm-Installer.py, Build-Norm-Installer-EXE.bat, Run-Norm-Installer.bat
+**Lines:** 1338 | **Classes:** 4 | **Functions:** 36
 **Schema:** 1
 
 ## What this is
 
-A significant jump from 1.0.0. Adds PostgreSQL and Redis connection setup,
-SHA-256 verification of the source package, and connection testing before
-install. The installer now validates the environment before touching the
-target directory.
+Introduces `Make-Norm-Installer.py`, a separate EXE builder that packages the
+installer into a distributable binary. The build pipeline is now two-stage:
+`Make-Norm-Installer.py` builds the EXE, `Build-Norm-Installer-EXE.bat`
+orchestrates it.
 
 ## Build & Run
 
-- **Build-Norm-Installer-EXE.bat** — PyInstaller build (larger than 1.0.0's, 2583 bytes)
+- **Make-Norm-Installer.py** — builds the installer EXE from source (NEW)
+- **Build-Norm-Installer-EXE.bat** — simplified to 583 bytes (was 2583 in 1.3.6)
 - **Run-Norm-Installer.bat** — source run
 
 ## Unique to this version
 
-- **PostgreSQL setup** — creates database, runs migrations
-- **Redis setup** — configures Memurai/Redis connection
-- **SHA-256 verification** — validates the portable-source ZIP before install
-- **Connection testing** — checks Postgres/Redis reachability pre-install
-- **PATCH-NOTES.txt** — first appearance of patch notes in the repo
+- **Make-Norm-Installer.py** — dedicated EXE builder (47,961 bytes)
+- Build bat simplified — the heavy lifting moved to the Python builder
+- Pre-release Norm 0.52.6 package
 
 ## Regressions vs later versions
 
-- Still no `Make-Norm-Installer.py` (arrives 1.4.0)
 - No `installer_environment.py` (arrives 1.6.6)
 - No plugin handling
 - No config snapshot / rollback
 - No headless mode
 
-## Progressions vs 1.0.0
+## Progressions vs 1.3.6
 
-- +PostgreSQL, +Redis, +SHA-256 verify, +connection test
-- ~430 more lines, ~11 more functions
+- +Make-Norm-Installer.py (dedicated EXE builder)
+- +2 functions
+- Build pipeline split into two stages
