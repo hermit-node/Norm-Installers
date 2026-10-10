@@ -1,30 +1,38 @@
-# Norm Installer 1.4.16
+# Norm Installer 1.5.0 (Unified)
 
-**Commit:** `a2a2c1c` — Norm 0.53.8
-**Files:** Norm-Installer.py, Make-Norm-Installer.py, Build-Norm-Installer-EXE.bat, Run-Norm-Installer.bat
-**Lines:** 1410 | **Classes:** 4 | **Functions:** 40
+**Commit:** `0a37bb6` — Norm 0.53.8
+**Files:** Norm-Installer.py, Build-Norm-Installer-EXE.bat, Run-Norm-Installer.bat, test_unified_installer.py
+**Lines:** 1616 | **Classes:** 4 | **Functions:** 44
 **Schema:** 1
 
 ## What this is
 
-Near-identical to 1.4.15 (same line count, function count, and byte counts).
-The difference is the `INSTALLER_VERSION` string and the Norm target (0.53.8
-vs 0.53.4). Last version in the 1.4.x series.
+The first "unified" installer. `Make-Norm-Installer.py` is **removed** — the
+EXE building logic is folded back into the main installer or the build bat.
+`test_unified_installer.py` appears for the first time.
 
 ## Build & Run
 
-- Same as 1.4.0–1.4.15
+- **Build-Norm-Installer-EXE.bat** — simplified to 407 bytes (was 583)
+- **Run-Norm-Installer.bat** — simplified to 329 bytes (was 437)
+- **test_unified_installer.py** — NEW test suite
 
 ## Unique to this version
 
-- Norm 0.53.8 target
-- **Last 1.4.x version** — the next release is 1.5.0 (unified)
+- **"unified" suffix** introduced in INSTALLER_VERSION
+- **Make-Norm-Installer.py REMOVED** — build logic consolidated
+- **test_unified_installer.py** — first dedicated test file
+- +4 functions, +206 lines over 1.4.16
 
 ## Regressions vs later versions
 
-- Same as 1.4.15
+- No `installer_environment.py` (arrives 1.6.6)
+- No `build_source_package.py` (arrives 1.6.0)
+- No plugin handling
+- No headless mode
 
-## Progressions vs 1.4.15
+## Progressions vs 1.4.16
 
-- Norm target bumped to 0.53.8
-- Version string change only
+- +4 functions, +206 lines
+- Build system simplified (Make-Norm-Installer.py removed)
+- Test suite added
