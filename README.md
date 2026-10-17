@@ -141,3 +141,7 @@ beside the 1.6.10 folder. It was **not** a different code variant:
 
 It was merged into the 1.6.10 folder and deleted. See the 1.6.10 README
 for the full story.
+
+## Browse all installer versions
+
+The complete source snapshot tree is in versions/README.md. Original release tags and historical commits are preserved. Source-only 1.6.11 and 1.6.12 revisions were added without compiled executables or bundled Norm source ZIPs.
