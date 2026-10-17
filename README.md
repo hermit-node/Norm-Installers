@@ -1,4 +1,24 @@
-# Norm Installer 1.6.16
+# Norm Installer 1.6.17
+
+Installer-owned Norm compilation is restored from the tested 1.6.12-unified
+install-kit implementation. This fixes the 1.6.16 regression that incorrectly
+required a build_script inside the source ZIP package manifest.
+
+The installer still accepts either a source ZIP or an unpacked source folder,
+including beside the installer, within Src, or in a peer Src directory.
+Two GUI selectors and --source are available. ZIP checksum validation,
+source safety checks, and operator plugin ingestion remain intact.
+
+The actual r25 source package now passes --validate-only unchanged. Its
+package manifest provides the version used for executable metadata instead
+of inheriting potentially stale project.version in settings.ini.
+
+Installer compilation runs internally with PyInstaller in the selected
+runtime venv, writes a separate candidate, executes its --version check,
+and only then promotes it to norm.exe. It does NOT run a source-supplied
+builder. A full live installation has not been performed by these tests.
+
+## 1.6.16 — ZIP or source folder selection
 
 Change from 1.6.15: Select a Norm source ZIP or unpacked source folder,
 without first rebuilding the source archive. Existing ZIP validation,
