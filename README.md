@@ -1,8 +1,37 @@
-# Norm Installer 1.6.15
+# Norm Installer 1.6.16
+
+Change from 1.6.15: Select a Norm source ZIP or unpacked source folder,
+without first rebuilding the source archive. Existing ZIP validation,
+source synchronization, secret preservation and operator plugin ingestion remain.
+
+## Package selection
+
+The installer searches for valid packages in these locations:
+
+- Source ZIP files beside the running installer.
+- Unpacked folder alongside the installer, containing package-manifest.json.
+- Src subfolder alongside the installer, or a selected parent containing Src.
+- Peer Src directory beside the installer directory.
+- Private .norm-local ZIPs retain priority for equivalent versions.
+
+The GUI has Choose ZIP... and Choose source folder... buttons. CLI --source
+accepts ZIP or directory. A folder is staged into a temporary copy before
+installation, excluding Git metadata and bytecode; symlinks are rejected.
+ZIP companion SHA256 checks remain enforced.
+
+Validation without actually installing:
+    python Norm-Installer.py --validate-only --source C:\path\to\Src
+    python Norm-Installer.py --validate-only --source C:\path\to\Norm-source.zip
+
+Some source archives (including the separately examined r25 sample) omit the
+required build_script manifest key. As with 1.6.15, the installer rejects
+such packages; source-folder support does not change the package contract.
+
+## 1.6.15 — Operator plugin ZIP ingestion
 
 **Base:** 1.6.10-unified (commit `cc8753e`, Norm 0.53.20)
 **Files:** Norm-Installer.py, installer_environment.py, Build-Installer.bat, Build-Installer.py, Run-Installer.bat, Norm-Installer.spec, norm-imprint.example.json, plugins/
-**INSTALLER_VERSION:** `1.6.15`
+**Version at this historical checkpoint:** `1.6.15`
 
 ## What this is
 

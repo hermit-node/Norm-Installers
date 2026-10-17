@@ -21,7 +21,7 @@ from typing import Any, Callable, Iterable
 
 import installer_environment as envtools
 
-INSTALLER_VERSION = "1.6.15"
+INSTALLER_VERSION = "1.6.16"
 PIP_VERSION = "26.2.1"
 PIP_MIN_VERSION = PIP_VERSION  # backward-compatible internal print helper
 PIP_SPEC = f"pip=={PIP_VERSION}"
@@ -34,7 +34,7 @@ class InstallerError(RuntimeError):
 
 @dataclass(frozen=True)
 class PackageInfo:
-    source_zip: Path
+    source_zip: Path  # Source ZIP or unpacked folder.
     zip_root: PurePosixPath
     manifest_member: str
     manifest: dict
@@ -485,35 +485,62 @@ def _validate_bundled_weasyprint(
 
 
 
+def _resolve_package_folder(path: Path) -> Path:
+    """Accept source contents directly, or a parent folder containing Src/."""
+    path = Path(path).expanduser().resolve()
+    if (path / "package-manifest.json").is_file():
+        return path
+    if (path / "Src" / "package-manifest.json").is_file():
+        return path / "Src"
+    raise InstallerError(
+        f"No package-manifest.json in {path} or its Src/ subfolder. "
+        "Select a Norm source folder rather than a build/output directory."
+    )
+
+
+def _source_relative_path(value: str) -> Path:
+    rel = _safe_zip_member(str(value).replace("\\", "/"))
+    if not rel.parts or str(rel) in (".", ""):
+        raise InstallerError(f"Empty manifest source path: {value!r}")
+    return Path(*rel.parts)
+
+
 def inspect_package(source_zip: Path) -> PackageInfo:
     source_zip = Path(source_zip).expanduser().resolve()
-    if not source_zip.is_file():
-        raise InstallerError(f"Source ZIP does not exist: {source_zip}")
-    if source_zip.suffix.lower() != ".zip":
-        raise InstallerError("Source package must be a .zip file")
-    _verify_companion_sha256(source_zip)
-
-    try:
-        with zipfile.ZipFile(source_zip, "r") as zf:
-            members = zf.namelist()
-            for member in members:
-                _safe_zip_member(member)
-            manifests = [
-                m for m in members
-                if PurePosixPath(m).name == "package-manifest.json"
-                and not m.endswith("/")
-            ]
-            if len(manifests) != 1:
-                raise InstallerError(
-                    f"Expected exactly one package-manifest.json, found {len(manifests)}"
-                )
-            manifest_member = manifests[0]
-            try:
-                manifest = json.loads(zf.read(manifest_member).decode("utf-8-sig"))
-            except Exception as exc:
-                raise InstallerError(f"Invalid package-manifest.json: {exc}") from exc
-    except zipfile.BadZipFile as exc:
-        raise InstallerError(f"Invalid ZIP file: {source_zip}") from exc
+    is_folder = source_zip.is_dir()
+    if is_folder:
+        source_zip = _resolve_package_folder(source_zip)
+        manifest_member = "package-manifest.json"
+        try:
+            manifest = json.loads((source_zip / manifest_member).read_text(encoding="utf-8-sig"))
+        except Exception as exc:
+            raise InstallerError(f"Invalid package-manifest.json: {exc}") from exc
+    else:
+        if not source_zip.is_file():
+            raise InstallerError(f"Source ZIP or folder does not exist: {source_zip}")
+        if source_zip.suffix.lower() != ".zip":
+            raise InstallerError("Source must be a ZIP file or unpacked Norm source folder")
+        _verify_companion_sha256(source_zip)
+        try:
+            with zipfile.ZipFile(source_zip, "r") as zf:
+                members = zf.namelist()
+                for member in members:
+                    _safe_zip_member(member)
+                manifests = [
+                    m for m in members
+                    if PurePosixPath(m).name == "package-manifest.json" and not m.endswith("/")
+                ]
+                if len(manifests) != 1:
+                    raise InstallerError(
+                        f"Expected exactly one package-manifest.json, found {len(manifests)}"
+                    )
+                manifest_member = manifests[0]
+                try:
+                    manifest = json.loads(zf.read(manifest_member).decode("utf-8-sig"))
+                except Exception as exc:
+                    raise InstallerError(f"Invalid package-manifest.json: {exc}") from exc
+        except zipfile.BadZipFile as exc:
+            raise InstallerError(f"Invalid ZIP file: {source_zip}") from exc
 
     schema = manifest.get("package_schema")
     if schema not in SUPPORTED_PACKAGE_SCHEMA:
@@ -541,13 +568,18 @@ def inspect_package(source_zip: Path) -> PackageInfo:
         raise InstallerError(f"Manifest missing required field(s): {', '.join(missing)}")
 
     root = PurePosixPath(manifest_member).parent
-    with zipfile.ZipFile(source_zip, "r") as zf:
-        names = set(zf.namelist())
-        for key in ("entrypoint", "settings", "requirements_lock", "build_script"):
-            rel = PurePosixPath(str(manifest[key]).replace("\\", "/"))
-            member = str(root / rel)
-            if member not in names:
-                raise InstallerError(f"Package is missing {key}: {manifest[key]}")
+    for key in ("entrypoint", "settings", "requirements_lock", "build_script"):
+        rel = _source_relative_path(str(manifest[key]))
+        if is_folder:
+            candidate = source_zip / rel
+            if (not candidate.is_file() or candidate.is_symlink()
+                    or not candidate.resolve().is_relative_to(source_zip)):
+                raise InstallerError(f"Package is missing or has unsafe {key}: {manifest[key]}")
+        else:
+            with zipfile.ZipFile(source_zip, "r") as zf:
+                member = str(root / PurePosixPath(*rel.parts))
+                if member not in set(zf.namelist()):
+                    raise InstallerError(f"Package is missing {key}: {manifest[key]}")
 
     return PackageInfo(
         source_zip=source_zip,
@@ -558,6 +590,18 @@ def inspect_package(source_zip: Path) -> PackageInfo:
 
 
 def _extract_package(info: PackageInfo, extraction_dir: Path) -> Path:
+    if info.source_zip.is_dir():
+        source = info.source_zip.resolve()
+        destination = extraction_dir.resolve()
+        if destination == source or destination.is_relative_to(source):
+            raise InstallerError("Staging folder cannot be inside the selected source folder")
+        # Never follow a source symlink outside the package.
+        for item in source.rglob("*"):
+            if item.is_symlink():
+                raise InstallerError(f"Source folder may not contain symlinks: {item}")
+        shutil.copytree(source, extraction_dir, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"))
+        return extraction_dir
     extraction_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(info.source_zip, "r") as zf:
         for entry in zf.infolist():
@@ -1308,6 +1352,7 @@ def install_norm(
 
     progress(2, "Validating package")
     info = inspect_package(source)
+    source = info.source_zip
     log(f"Package: {info.label}")
     log(f"Source:  {source}")
     log(f"Target:  {target}")
@@ -1318,10 +1363,14 @@ def install_norm(
     with tempfile.TemporaryDirectory(prefix="norm-installer-") as temp_name:
         temp = Path(temp_name)
         progress(8, "Staging source package")
-        staged_zip = temp / source.name
-        shutil.copy2(source, staged_zip)
-        staged_info = inspect_package(staged_zip)
-        extracted_root = _extract_package(staged_info, temp / "source")
+        if source.is_dir():
+            extracted_root = _extract_package(info, temp / "source")
+            staged_info = inspect_package(extracted_root)
+        else:
+            staged_zip = temp / source.name
+            shutil.copy2(source, staged_zip)
+            staged_info = inspect_package(staged_zip)
+            extracted_root = _extract_package(staged_info, temp / "source")
         settings = _read_settings(extracted_root, staged_info.manifest)
 
         progress(14, "Checking Python")
@@ -2009,16 +2058,21 @@ def _apply_imprint(
         log(f"Secrets were written/preserved only in configured secrets file: {secrets_path} (values not logged).")
 
 def _peek_norm_source(path: Path) -> tuple[str, str] | None:
-    """Return (version, package_type) for a Norm package without enforcing its companion SHA yet."""
+    """Identify a nearby Norm source ZIP or unpacked source folder."""
     try:
-        with zipfile.ZipFile(path, "r") as zf:
-            manifests = [
-                name for name in zf.namelist()
-                if PurePosixPath(name).name == "package-manifest.json" and not name.endswith("/")
-            ]
-            if len(manifests) != 1:
-                return None
-            manifest = json.loads(zf.read(manifests[0]).decode("utf-8-sig"))
+        if path.is_dir():
+            manifest = json.loads(
+                (_resolve_package_folder(path) / "package-manifest.json").read_text(encoding="utf-8-sig")
+            )
+        else:
+            with zipfile.ZipFile(path, "r") as zf:
+                manifests = [
+                    name for name in zf.namelist()
+                    if PurePosixPath(name).name == "package-manifest.json" and not name.endswith("/")
+                ]
+                if len(manifests) != 1:
+                    return None
+                manifest = json.loads(zf.read(manifests[0]).decode("utf-8-sig"))
     except Exception:
         return None
     if str(manifest.get("name") or "").strip().lower() != "norm":
@@ -2030,25 +2084,35 @@ def _peek_norm_source(path: Path) -> tuple[str, str] | None:
 
 
 def list_local_sources(directory: Path | None = None) -> list[Path]:
-    """Return valid local Norm source ZIPs, highest package version first.
+    """Discover source ZIPs and unpacked folders beside installer or a peer Src/.
 
-    Local operator packages under .norm-local are considered first and win
-    same-version ties. The .norm-local directory is Git-ignored and is never
-    part of the public release bundle.
+    Only a single directory level is considered. Private .norm-local packages
+    retain priority for equal versions, and ZIPs win equal-version public ties.
     """
     root = Path(directory).resolve() if directory else _source_directory()
-    candidates: list[tuple[tuple, int, int, str, Path]] = []
+    candidates: list[tuple[tuple, int, int, int, str, Path]] = []
+    roots = [(root / LOCAL_PRIVATE_DIR, 2), (root, 1),
+             (root / "Src", 1), (root.parent / "Src", 0)]
+    seen: set[str] = set()
 
-    search_roots: list[tuple[Path, int]] = []
-    private_root = root / LOCAL_PRIVATE_DIR
-    if private_root.is_dir():
-        search_roots.append((private_root, 1))
-    search_roots.append((root, 0))
-
-    for search_root, private_priority in search_roots:
-        for path in search_root.glob("*.zip"):
-            if not path.is_file():
+    for search_root, priority in roots:
+        if not search_root.is_dir():
+            continue
+        possible = [search_root, *search_root.glob("*.zip"), *search_root.iterdir()]
+        for path in possible:
+            if not path.is_file() and not path.is_dir():
                 continue
+            if path.is_file() and path.suffix.lower() != ".zip":
+                continue
+            if path.is_dir() and not (
+                (path / "package-manifest.json").is_file()
+                or (path / "Src" / "package-manifest.json").is_file()
+            ):
+                continue
+            key = os.path.normcase(str(path.resolve()))
+            if key in seen:
+                continue
+            seen.add(key)
             meta = _peek_norm_source(path)
             if meta is None:
                 continue
@@ -2057,21 +2121,12 @@ def list_local_sources(directory: Path | None = None) -> list[Path]:
                 mtime = path.stat().st_mtime_ns
             except OSError:
                 mtime = 0
-            candidates.append(
-                (
-                    _version_key(version),
-                    private_priority,
-                    mtime,
-                    path.name.lower(),
-                    path.resolve(),
-                )
-            )
+            candidates.append((_version_key(version), priority,
+                               1 if path.is_file() else 0, mtime,
+                               path.name.lower(), path.resolve()))
 
-    candidates.sort(
-        key=lambda item: (item[0], item[1], item[2], item[3]),
-        reverse=True,
-    )
-    return [item[4] for item in candidates]
+    candidates.sort(key=lambda item: item[:5], reverse=True)
+    return [item[5] for item in candidates]
 
 
 def find_latest_source(directory: Path | None = None) -> Path | None:
@@ -2090,20 +2145,12 @@ def _normalized_requirements_text(text: str) -> str:
 
 
 def _source_requirements_text(source_zip: Path) -> str:
-    with zipfile.ZipFile(source_zip, "r") as zf:
-        manifests = [
-            name for name in zf.namelist()
-            if PurePosixPath(name).name == "package-manifest.json" and not name.endswith("/")
-        ]
-        if len(manifests) != 1:
-            raise InstallerError(f"Expected exactly one package-manifest.json in {source_zip.name}")
-        manifest_member = manifests[0]
-        manifest = json.loads(zf.read(manifest_member).decode("utf-8-sig"))
-        root = PurePosixPath(manifest_member).parent
-        rel = PurePosixPath(str(manifest.get("requirements_lock") or "").replace("\\", "/"))
-        if not rel.parts:
-            raise InstallerError("Selected source package has no requirements_lock entry")
-        member = str(root / rel)
+    info = inspect_package(source_zip)
+    rel = _source_relative_path(str(info.manifest.get("requirements_lock") or ""))
+    if info.source_zip.is_dir():
+        return (info.source_zip / rel).read_text(encoding="utf-8-sig")
+    member = str(info.zip_root / PurePosixPath(*rel.parts))
+    with zipfile.ZipFile(info.source_zip, "r") as zf:
         try:
             return zf.read(member).decode("utf-8-sig")
         except KeyError as exc:
@@ -2398,7 +2445,7 @@ def launch_gui(initial_source: Path | None = None, imprint_path: Path | None = N
     def browse_source() -> None:
         nonlocal selected_source
         path = filedialog.askopenfilename(
-            title="Select Norm portable source ZIP",
+            title="Select Norm source ZIP",
             initialdir=str(_source_directory()),
             filetypes=[("Norm source ZIP", "*.zip"), ("All files", "*.*")],
         )
@@ -2406,8 +2453,21 @@ def launch_gui(initial_source: Path | None = None, imprint_path: Path | None = N
             selected_source = Path(path).resolve()
             analyze_source()
 
-    ttk.Button(package_box, text="Advanced: choose another package…", command=browse_source).grid(
-        row=2, column=0, sticky="w", pady=(10, 0)
+    def browse_source_folder() -> None:
+        nonlocal selected_source
+        path = filedialog.askdirectory(
+            title="Select unpacked Norm source folder (or parent containing Src)",
+            initialdir=str(_source_directory()),
+        )
+        if path:
+            selected_source = Path(path).resolve()
+            analyze_source()
+
+    package_actions = ttk.Frame(package_box)
+    package_actions.grid(row=2, column=0, sticky="w", pady=(10, 0))
+    ttk.Button(package_actions, text="Choose ZIP...", command=browse_source).pack(side="left")
+    ttk.Button(package_actions, text="Choose source folder...", command=browse_source_folder).pack(
+        side="left", padx=(8, 0)
     )
 
     req_box = ttk.LabelFrame(page_setup, text="Requirements", padding=12)
@@ -2920,19 +2980,27 @@ def launch_gui(initial_source: Path | None = None, imprint_path: Path | None = N
             selected_source = find_latest_source()
         if selected_source is None:
             selected_info = None
-            package_var.set("No Norm portable-source package found")
-            package_detail_var.set("Place Norm-*-portable-source.zip beside this installer.")
+            package_var.set("No Norm source package found")
+            package_detail_var.set(
+                "Place a source ZIP or unpacked source folder beside the installer, "
+                "or put source contents in a peer folder named Src."
+            )
             next_btn.configure(state="disabled")
             return
         try:
-            _verify_companion_sha256(selected_source)
             selected_info = inspect_package(selected_source)
-            package_var.set(f"{selected_info.label}  •  {selected_source.name}")
-            package_detail_var.set(
-                "✓ Local private package selected from .norm-local  •  ✓ SHA-256 verified"
-                if LOCAL_PRIVATE_DIR in selected_source.parts
-                else "✓ Highest valid public package version found beside installer  •  ✓ SHA-256 verified"
+            selected_source = selected_info.source_zip
+            kind = "Unpacked source folder" if selected_source.is_dir() else "Source ZIP"
+            has_companion = (
+                selected_source.is_file()
+                and selected_source.with_name(selected_source.name + ".sha256").is_file()
             )
+            verification = (
+                "SHA-256 companion verified"
+                if has_companion else "Manifest and required package files validated"
+            )
+            package_var.set(f"{selected_info.label}  -  {selected_source.name}")
+            package_detail_var.set(f"{kind}: {selected_source}  -  {verification}")
             if not python_var.get().strip():
                 default_py = choose_default_python(selected_source)
                 if default_py:
@@ -3119,7 +3187,7 @@ def launch_gui(initial_source: Path | None = None, imprint_path: Path | None = N
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Reusable local Norm installer; source package is selected at runtime")
-    parser.add_argument("--source", help=argparse.SUPPRESS)
+    parser.add_argument("--source", help="Norm source ZIP or unpacked folder (may contain Src/)")
     parser.add_argument("--target", help="Installation directory")
     parser.add_argument("--python", dest="python_exe", help="Python executable used to create the Norm venv")
     parser.add_argument("--imprint", help=f"Non-secret imprint JSON; defaults to {LOCAL_IMPRINT_NAME} beside installer")
@@ -3156,12 +3224,13 @@ def main() -> int:
 
     if args.validate_only:
         if not source:
-            raise InstallerError(f"No Norm portable-source ZIP was found beside the installer in {_source_directory()}")
+            raise InstallerError(f"No Norm source ZIP or folder was found near {_source_directory()}")
         info = inspect_package(source)
         print(json.dumps({
             "installer_version": INSTALLER_VERSION,
-            "source_selection": "explicit --source" if args.source else "most recently modified local package",
+            "source_selection": "explicit --source" if args.source else "highest-version nearby source",
             "source": str(info.source_zip),
+            "source_type": "directory" if info.source_zip.is_dir() else "zip",
             "name": info.name,
             "version": info.version,
             "package_schema": info.manifest.get("package_schema"),
@@ -3177,7 +3246,7 @@ def main() -> int:
         python_arg = args.python_exe or str(install_cfg.get("python_exe") or "")
         if not source or not target_arg or not python_arg:
             parser.error(
-                "--install requires a local Norm source package plus target/python values "
+                "--install requires a local Norm source ZIP or folder plus target/python values "
                 "(from CLI or the non-secret imprint)"
             )
         secret_values: dict[str, str] = {}
