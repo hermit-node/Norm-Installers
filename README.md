@@ -27,11 +27,10 @@ Some source archives (including the separately examined r25 sample) omit the
 required build_script manifest key. As with 1.6.15, the installer rejects
 such packages; source-folder support does not change the package contract.
 
-## 1.6.15 — Operator plugin ZIP ingestion
 
 **Base:** 1.6.10-unified (commit `cc8753e`, Norm 0.53.20)
 **Files:** Norm-Installer.py, installer_environment.py, Build-Installer.bat, Build-Installer.py, Run-Installer.bat, Norm-Installer.spec, norm-imprint.example.json, plugins/
-**Version at this historical checkpoint:** `1.6.15`
+**INSTALLER_VERSION:** `1.6.15`
 
 ## What this is
 
