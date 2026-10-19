@@ -433,6 +433,13 @@ def _validate_bundled_weasyprint(
     python_exe: Path,
     log: LogFn,
 ) -> None:
+    """Validate the packaged WeasyPrint/Pango runtime and self-heal it when incomplete.
+
+    The installer performs one installed-runtime check. If that check fails for any reason
+    (missing executable/DLL, stale WeasyPrint, missing Pango, or failed render), the package's
+    verified fetch helper is forced to reconstruct the complete runtime atomically. The helper
+    performs its own staged/final validation, so the installer does not repeat the same probe.
+    """
     cfg = dict((manifest.get("bundled_tools") or {}).get("weasyprint") or {})
     if not cfg:
         return
@@ -475,13 +482,13 @@ def _validate_bundled_weasyprint(
                 f"WeasyPrint runtime is missing/invalid and fetch helper is unavailable: {helper}"
             ) from first_error
         log(
-            "WeasyPrint/Pango runtime is missing or stale; downloading the package-pinned "
-            "official runtime and verifying its SHA-256."
+            f"WeasyPrint/Pango validation failed ({first_error}); forcing reconstruction from "
+            "the package-pinned official runtime."
         )
-        _run([str(python_exe), str(helper), "--quiet"], cwd=target, log=log)
-
-    validate_existing()
-    log(f"Downloaded/repaired verified WeasyPrint/Pango runtime: {exe}")
+        _run([str(python_exe), str(helper), "--force", "--quiet"], cwd=target, log=log)
+        if not exe.is_file():
+            raise InstallerError(f"WeasyPrint repair completed without restoring {exe}")
+        log(f"Downloaded/repaired verified WeasyPrint/Pango runtime: {exe}")
 
 
 
@@ -699,22 +706,43 @@ def _configured_torch(settings: configparser.ConfigParser) -> tuple[str, str] | 
 
 
 def _windows_version_tuple(value: str) -> tuple[int, int, int, int]:
-    """Map Norm versions such as 0.54.0-beta2 or 0.54.0b to Windows 4-part metadata."""
+    """Map Norm release labels to stable Windows 4-part version metadata.
+
+    Accepted examples include 0.54.2, 0.54.2g, 0.54.2g2, 0.54.2-beta2,
+    0.54.2beta2, 0.54.2-b2, 0.54.2b2, 0.54.2-rc1, and 0.54.2rc1.
+    Plain single-letter suffixes preserve the historical a=1, b=2, ... mapping.
+    A letter plus an iteration uses a collision-free 100-based bucket (b2 -> 202),
+    matching the named beta2 bucket without changing the meaning of a plain 'b'.
+    """
+    text = value.strip()
     match = re.fullmatch(
-        r"(\d+)\.(\d+)\.(\d+)(?:(?:-)?(alpha|beta|rc)(\d*)|([a-zA-Z]))?",
-        value.strip(),
+        r"(\d+)\.(\d+)\.(\d+)(?:[-_.]?(?:(alpha|beta|rc)(\d*)|([a-zA-Z])(\d*)))?",
+        text,
         re.IGNORECASE,
     )
     if not match:
         raise InstallerError(f"Unsupported Norm version for Windows metadata: {value!r}")
+
     major, minor, patch = (int(match.group(i)) for i in (1, 2, 3))
-    label = match.group(4)
-    iteration = int(match.group(5) or 0)
-    suffix = match.group(6)
-    if label:
-        revision = {"alpha": 100, "beta": 200, "rc": 300}[label.lower()] + max(1, iteration)
+    named = (match.group(4) or "").lower()
+    named_iteration = match.group(5) or ""
+    letter = (match.group(6) or "").lower()
+    letter_iteration = match.group(7) or ""
+
+    if named:
+        base = {"alpha": 100, "beta": 200, "rc": 300}[named]
+        revision = base + max(1, int(named_iteration or "1"))
+    elif letter:
+        ordinal = ord(letter) - ord("a") + 1
+        if letter_iteration:
+            revision = ordinal * 100 + int(letter_iteration)
+        else:
+            revision = ordinal
     else:
-        revision = (ord(suffix.lower()) - ord("a") + 1) if suffix else 0
+        revision = 0
+
+    if not 0 <= revision <= 65535:
+        raise InstallerError(f"Norm version revision exceeds Windows version limits: {value!r}")
     return major, minor, patch, revision
 
 
@@ -759,10 +787,9 @@ def _build_norm_candidate(target: Path, manifest: dict, venv_python: Path, log: 
 
     build_root = target / "staging" / "installer-norm-build"
     shutil.rmtree(build_root, ignore_errors=True)
-    dist_dir = build_root / "dist"
     work_dir = target / "state" / "build-cache" / "pyinstaller" / "work"
     spec_dir = target / "state" / "build-cache" / "pyinstaller" / "spec"
-    for directory in (dist_dir, work_dir, spec_dir):
+    for directory in (build_root, work_dir, spec_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
     version_file = build_root / "version_info.txt"
@@ -776,13 +803,13 @@ def _build_norm_candidate(target: Path, manifest: dict, venv_python: Path, log: 
         "--collect-all", "pymupdf",
         "--hidden-import", "_cffi_backend",
         "--version-file", str(version_file),
-        "--distpath", str(dist_dir),
+        "--distpath", str(build_root),
         "--workpath", str(work_dir),
         "--specpath", str(spec_dir),
         str(entrypoint),
     ]
     _run(cmd, cwd=target, log=log)
-    candidate = dist_dir / ("norm.exe" if os.name == "nt" else "norm")
+    candidate = build_root / ("norm.exe" if os.name == "nt" else "norm")
     if not candidate.is_file() or candidate.stat().st_size == 0:
         raise InstallerError(f"PyInstaller build did not produce {candidate}")
     if os.name == "nt":
@@ -1098,28 +1125,47 @@ def _sync_tree_contents(
     return stats
 
 
-def _installed_version(python_exe: Path, distribution: str, log: LogFn) -> str | None:
-    code = (
-        "import importlib.metadata as m; "
-        f"print(m.version({distribution!r}))"
-    )
+def _canonical_dist_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", str(name).strip()).lower()
+
+
+def _installed_versions(python_exe: Path, distributions: Iterable[str]) -> dict[str, str]:
+    """Read all requested installed versions in one interpreter invocation."""
+    requested = sorted({_canonical_dist_name(name): str(name) for name in distributions}.items())
+    if not requested:
+        return {}
+    names = [original for _, original in requested]
+    code = """import importlib.metadata as m, json, sys
+names = json.loads(sys.argv[1])
+out = {}
+for name in names:
+    try:
+        out[name] = m.version(name)
+    except m.PackageNotFoundError:
+        out[name] = None
+print(json.dumps(out, sort_keys=True))
+"""
     try:
         cp = subprocess.run(
-            [str(python_exe), "-c", code],
+            [str(python_exe), "-c", code, json.dumps(names)],
             cwd=None,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=15,
+            timeout=30,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
         )
+        if cp.returncode != 0:
+            return {}
+        raw = json.loads((cp.stdout or "{}").strip() or "{}")
     except Exception:
-        return None
-    if cp.returncode != 0:
-        return None
-    value = (cp.stdout or "").strip().splitlines()
-    return value[-1].strip() if value else None
+        return {}
+    return {_canonical_dist_name(name): str(version) for name, version in raw.items() if version}
+
+def _installed_version(python_exe: Path, distribution: str, log: LogFn) -> str | None:
+    # Compatibility wrapper for single-package checks such as pip/PyTorch.
+    return _installed_versions(python_exe, [distribution]).get(_canonical_dist_name(distribution))
 
 
 def _exact_requirement_pins(requirements: Path) -> dict[str, str]:
@@ -1135,21 +1181,342 @@ def _exact_requirement_pins(requirements: Path) -> dict[str, str]:
     return pins
 
 
-def _requirements_exactly_satisfied(python_exe: Path, requirements: Path, log: LogFn) -> bool:
+def _dependency_evidence_dir(target: Path) -> Path:
+    path = target / "state" / "installer"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _write_dependency_delta(target: Path, delta: dict[str, str]) -> Path:
+    path = _dependency_evidence_dir(target) / "dependency-delta.txt"
+    lines = [f"{name}=={version}" for name, version in sorted(delta.items(), key=lambda item: _canonical_dist_name(item[0]))]
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8", newline="\n")
+    return path
+
+
+def _inventory_installed_environment(
+    venv_python: Path,
+    managed_names: Iterable[str],
+    target: Path,
+    log: LogFn,
+    protected_exact: dict[str, str] | None = None,
+) -> tuple[dict[str, Any], Path]:
+    """Inventory the venv once and derive constraints from packages Norm does not manage.
+
+    Those constraints keep an older/unrelated package already present in the same venv from
+    being silently broken by a newer Norm-managed dependency. Nothing is installed here.
+    """
+    managed = sorted({_canonical_dist_name(name) for name in managed_names})
+    code = r"""import importlib.metadata as md, json, re, sys
+try:
+    from packaging.requirements import Requirement
+    from packaging.markers import default_environment
+except Exception:
+    from pip._vendor.packaging.requirements import Requirement
+    from pip._vendor.packaging.markers import default_environment
+
+def canon(name):
+    return re.sub(r"[-_.]+", "-", str(name).strip()).lower()
+
+managed = set(json.loads(sys.argv[1]))
+env = default_environment(); env["extra"] = ""
+records = {}
+constraints = set()
+parse_errors = []
+for dist in md.distributions():
+    name = str(dist.metadata.get("Name") or "").strip()
+    version = str(dist.version or "").strip()
+    if not name or not version:
+        continue
+    key = canon(name)
+    requires = list(dist.requires or [])
+    records[key] = {"name": name, "version": version, "requires": requires}
+    if key in managed:
+        continue
+    for raw in requires:
+        try:
+            req = Requirement(raw)
+            if req.marker is not None and not req.marker.evaluate(env):
+                continue
+            if req.url or not str(req.specifier):
+                continue
+            constraints.add(f"{req.name}{req.specifier}")
+        except Exception as exc:
+            parse_errors.append({"owner": name, "requirement": raw, "error": str(exc)})
+print(json.dumps({"records": records, "constraints": sorted(constraints), "parse_errors": parse_errors}, sort_keys=True))
+"""
+    cp = subprocess.run(
+        [str(venv_python), "-c", code, json.dumps(managed)],
+        cwd=None,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+    )
+    if cp.returncode != 0:
+        raise InstallerError(f"Could not inventory installed dependency metadata: {(cp.stderr or cp.stdout or '').strip()}")
+    try:
+        payload = json.loads((cp.stdout or "{}").strip() or "{}")
+    except Exception as exc:
+        raise InstallerError(f"Could not parse installed dependency inventory: {exc}") from exc
+
+    evidence = _dependency_evidence_dir(target)
+    inventory_path = evidence / "installed-environment.json"
+    inventory_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+    constraints_path = evidence / "compatibility-constraints.txt"
+    constraints = [str(item).strip() for item in payload.get("constraints") or [] if str(item).strip()]
+    protected = {
+        _canonical_dist_name(name): str(version).strip()
+        for name, version in (protected_exact or {}).items()
+        if str(name).strip() and str(version).strip()
+    }
+    if protected:
+        records = payload.get("records") or {}
+        for canonical, version in sorted(protected.items()):
+            record = records.get(canonical) or {}
+            installed = str(record.get("version") or "").strip()
+            if installed and installed != version:
+                raise InstallerError(
+                    f"Protected dependency {canonical} is {installed}, expected {version}; "
+                    "reconcile the special dependency before generic resolution."
+                )
+            constraints.append(f"{canonical}=={version}")
+    constraints = sorted(set(constraints), key=str.casefold)
+    constraints_path.write_text("\n".join(constraints) + ("\n" if constraints else ""), encoding="utf-8", newline="\n")
+    log(
+        f"Inventoried {len(payload.get('records') or {})} installed distributions once; "
+        f"derived {len(constraints)} compatibility constraint(s), including "
+        f"{len(protected)} installer-protected exact version(s)."
+    )
+    parse_errors = payload.get("parse_errors") or []
+    if parse_errors:
+        log(f"WARNING: {len(parse_errors)} installed requirement metadata line(s) could not be parsed; recorded in {inventory_path}.")
+    return payload, constraints_path
+
+
+def _pip_dry_run_report(
+    venv_python: Path,
+    target: Path,
+    requested: list[str],
+    constraints_path: Path,
+    report_name: str,
+    log: LogFn,
+) -> dict[str, Any]:
+    report = _dependency_evidence_dir(target) / report_name
+    report.unlink(missing_ok=True)
+    cmd = [
+        str(venv_python), "-m", "pip", "install",
+        "--disable-pip-version-check", "--upgrade", "--upgrade-strategy", "eager",
+        "--dry-run", "--report", str(report),
+    ]
+    if constraints_path.is_file() and constraints_path.stat().st_size:
+        cmd.extend(["--constraint", str(constraints_path)])
+    cmd.extend(requested)
+    _run(cmd, cwd=target, log=log)
+    if not report.is_file():
+        raise InstallerError("pip resolver did not produce its compatibility report")
+    try:
+        return json.loads(report.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        raise InstallerError(f"Could not read pip resolver report: {exc}") from exc
+
+
+def _report_delta(payload: dict[str, Any]) -> dict[str, str]:
+    delta: dict[str, str] = {}
+    for item in payload.get("install") or []:
+        meta = item.get("metadata") or {}
+        name = str(meta.get("name") or "").strip()
+        version = str(meta.get("version") or "").strip()
+        if name and version:
+            delta[name] = version
+    return delta
+
+
+def _check_projected_environment_compatibility(
+    venv_python: Path,
+    inventory: dict[str, Any],
+    resolver_report: dict[str, Any],
+    target: Path,
+    log: LogFn,
+) -> None:
+    """Check the complete projected venv before any dependency change is installed.
+
+    pip resolves the requested Norm graph while compatibility constraints preserve the needs of
+    unrelated installed packages. This second in-memory check overlays the proposed candidates
+    on every installed distribution and evaluates Requires-Dist metadata. It is verification,
+    not another resolver invocation.
+    """
+    evidence = _dependency_evidence_dir(target)
+    input_path = evidence / "projected-environment-input.json"
+    result_path = evidence / "projected-environment-check.json"
+    payload = {"inventory": inventory, "resolver_report": resolver_report}
+    input_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+
+    code = r"""import json, re, sys
+try:
+    from packaging.requirements import Requirement
+    from packaging.version import Version
+    from packaging.markers import default_environment
+except Exception:
+    from pip._vendor.packaging.requirements import Requirement
+    from pip._vendor.packaging.version import Version
+    from pip._vendor.packaging.markers import default_environment
+
+def canon(name):
+    return re.sub(r"[-_.]+", "-", str(name).strip()).lower()
+
+data = json.load(open(sys.argv[1], "r", encoding="utf-8-sig"))
+records = dict((data.get("inventory") or {}).get("records") or {})
+projected = {key: str(value.get("version") or "") for key, value in records.items()}
+requirements_by_owner = {key: list(value.get("requires") or []) for key, value in records.items()}
+owners = {key: str(value.get("name") or key) for key, value in records.items()}
+
+for item in (data.get("resolver_report") or {}).get("install") or []:
+    meta = item.get("metadata") or {}
+    name = str(meta.get("name") or "").strip()
+    version = str(meta.get("version") or "").strip()
+    if not name or not version:
+        continue
+    key = canon(name)
+    projected[key] = version
+    owners[key] = name
+    requirements_by_owner[key] = list(meta.get("requires_dist") or [])
+
+env = default_environment(); env["extra"] = ""
+conflicts = []
+parse_errors = []
+for owner_key, reqs in requirements_by_owner.items():
+    owner = owners.get(owner_key, owner_key)
+    for raw in reqs:
+        try:
+            req = Requirement(raw)
+            if req.marker is not None and not req.marker.evaluate(env):
+                continue
+            dep_key = canon(req.name)
+            dep_version = projected.get(dep_key)
+            if dep_version is None:
+                conflicts.append({"owner": owner, "requirement": raw, "problem": "missing dependency"})
+                continue
+            if req.specifier and not req.specifier.contains(Version(dep_version), prereleases=True):
+                conflicts.append({"owner": owner, "requirement": raw, "installed_or_proposed": dep_version, "problem": "version conflict"})
+        except Exception as exc:
+            parse_errors.append({"owner": owner, "requirement": raw, "error": str(exc)})
+result = {"ok": not conflicts, "projected_versions": projected, "conflicts": conflicts, "parse_errors": parse_errors}
+print(json.dumps(result, sort_keys=True))
+"""
+    cp = subprocess.run(
+        [str(venv_python), "-c", code, str(input_path)],
+        cwd=target,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+    )
+    if cp.returncode != 0:
+        raise InstallerError(f"Projected dependency compatibility check failed to execute: {(cp.stderr or cp.stdout or '').strip()}")
+    try:
+        result = json.loads((cp.stdout or "{}").strip() or "{}")
+    except Exception as exc:
+        raise InstallerError(f"Could not parse projected compatibility result: {exc}") from exc
+    result_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+    conflicts = result.get("conflicts") or []
+    if conflicts:
+        sample = "; ".join(
+            f"{item.get('owner')}: {item.get('requirement')} (projected {item.get('installed_or_proposed', 'missing')})"
+            for item in conflicts[:8]
+        )
+        raise InstallerError(
+            f"Newest dependency proposal would break {len(conflicts)} installed requirement(s); no dependency changes were made. "
+            f"{sample}. Full evidence: {result_path}"
+        )
+    parse_errors = result.get("parse_errors") or []
+    if parse_errors:
+        log(f"WARNING: projected compatibility check could not parse {len(parse_errors)} metadata requirement(s); details recorded in {result_path}.")
+    log(f"Projected full-venv compatibility passed before install ({len(result.get('projected_versions') or {})} distributions checked).")
+
+
+def _resolve_pinned_dependency_delta(
+    venv_python: Path,
+    requirements: Path,
+    target: Path,
+    log: LogFn,
+    protected_exact: dict[str, str] | None = None,
+) -> dict[str, str]:
     pins = _exact_requirement_pins(requirements)
     if not pins:
-        return False
-    mismatched: list[str] = []
-    for name, expected in pins.items():
-        installed = _installed_version(python_exe, name, log)
-        if installed != expected:
-            mismatched.append(f"{name}: installed={installed or 'missing'} expected={expected}")
-    if mismatched:
-        log("Pinned dependency reconciliation required: " + "; ".join(mismatched[:12]))
-        if len(mismatched) > 12:
-            log(f"... and {len(mismatched) - 12} more mismatch(es)")
-        return False
-    return True
+        raise InstallerError(f"No exact package requirements were found in {requirements}")
+    managed = sorted(pins, key=_canonical_dist_name)
+    inventory, constraints = _inventory_installed_environment(venv_python, managed, target, log, protected_exact)
+    records = inventory.get("records") or {}
+    already_exact = all(
+        str((records.get(_canonical_dist_name(name)) or {}).get("version") or "") == expected
+        for name, expected in pins.items()
+    )
+    if already_exact:
+        log("Every package-locked distribution already matches exactly; resolver/install skipped.")
+        return {}
+
+    requested = [f"{name}=={pins[name]}" for name in managed]
+    log("Validating exact package lock against the complete existing venv once before install.")
+    report = _pip_dry_run_report(venv_python, target, requested, constraints, "pip-package-resolve-report.json", log)
+    _check_projected_environment_compatibility(venv_python, inventory, report, target, log)
+    projected = {
+        _canonical_dist_name(name): str((records.get(_canonical_dist_name(name)) or {}).get("version") or "")
+        for name in pins
+    }
+    for name, version in _report_delta(report).items():
+        projected[_canonical_dist_name(name)] = version
+    wrong = [f"{name}: projected={projected.get(_canonical_dist_name(name)) or 'missing'} expected={version}" for name, version in pins.items() if projected.get(_canonical_dist_name(name)) != version]
+    if wrong:
+        raise InstallerError("Exact package lock could not be projected cleanly: " + "; ".join(wrong[:12]))
+    return _report_delta(report)
+
+
+def _resolve_newest_dependency_delta(
+    venv_python: Path,
+    requirements: Path,
+    target: Path,
+    log: LogFn,
+    protected_exact: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Resolve the newest set that remains compatible with the entire existing venv."""
+    pins = _exact_requirement_pins(requirements)
+    if not pins:
+        raise InstallerError(f"No exact package requirements were found in {requirements}")
+    requested = sorted(pins, key=_canonical_dist_name)
+    inventory, constraints = _inventory_installed_environment(venv_python, requested, target, log, protected_exact)
+    log(
+        "Resolving newest mutually-compatible non-prerelease releases while preserving "
+        "requirements of older/unmanaged packages already in this venv: " + ", ".join(requested)
+    )
+    report = _pip_dry_run_report(venv_python, target, requested, constraints, "pip-resolve-report.json", log)
+    _check_projected_environment_compatibility(venv_python, inventory, report, target, log)
+    return _report_delta(report)
+
+
+def _install_dependency_delta(
+    venv_python: Path,
+    target: Path,
+    delta: dict[str, str],
+    log: LogFn,
+) -> None:
+    delta_file = _write_dependency_delta(target, delta)
+    if not delta:
+        log("Dependency delta is empty; nothing will be installed into the existing venv.")
+        return
+    log(f"Installing only {len(delta)} already-resolved distribution change(s) from {delta_file}")
+    _run(
+        [
+            str(venv_python), "-m", "pip", "install", "--disable-pip-version-check",
+            "--no-deps", "-r", str(delta_file),
+        ],
+        cwd=target,
+        log=log,
+    )
 
 
 def _external_path(settings: configparser.ConfigParser, key: str, default: str) -> Path:
@@ -1186,6 +1553,14 @@ def _post_install_workspace(settings: configparser.ConfigParser, target: Path, w
 
     (target / "logs").mkdir(exist_ok=True)
     (target / "state").mkdir(exist_ok=True)
+
+
+def _installer_resource(name: str) -> Path:
+    for root in _candidate_roots():
+        candidate = root / "resources" / name
+        if candidate.is_file():
+            return candidate
+    raise InstallerError(f"Installer resource is missing: resources/{name}")
 
 
 def _find_pg_restore(settings: configparser.ConfigParser, preferred: str) -> Path | None:
@@ -1361,14 +1736,18 @@ def install_norm(
             "backups",
             ".env",
             ".norm-install-state.json",
-            "config/plugins.ini",
+            "Norm-Remote.exe",
+            "Norm-Listener.exe",
+            "Norm-Listener.json",
             "tools/weasyprint/runtime",
         }
 
         config_snapshot = _snapshot_existing_config(target, log) if target_nonempty else None
 
         progress(20, "Synchronizing Norm files")
-        ignore_source = {"backup-state", "SENSITIVE_BACKUP.txt"} if staged_info.manifest.get("package_type") == "full-backup" else set()
+        ignore_source = {"tools/build_norm.py"}
+        if staged_info.manifest.get("package_type") == "full-backup":
+            ignore_source.update({"backup-state", "SENSITIVE_BACKUP.txt"})
         stats = _sync_tree_contents(extracted_root, target, protected=protected, log=log, ignore_source_roots=ignore_source)
         _restore_operator_config(target, config_snapshot, package_version=staged_info.version, log=log)
         for subtree in staged_info.manifest.get("managed_persistent_subtrees", []) or []:
@@ -1407,6 +1786,12 @@ def install_norm(
         # a local sidecar to deterministically bind this installation to its environment.
         installed_manifest_path = target / "package-manifest.json"
         installed_manifest = json.loads(installed_manifest_path.read_text(encoding="utf-8-sig"))
+        if installed_manifest.pop("build_script", None) is not None:
+            installed_manifest_path.write_text(
+                json.dumps(installed_manifest, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8", newline="\n",
+            )
+            log("Removed legacy package build_script metadata; norm.exe build logic is installer-owned.")
         _apply_imprint(
             target,
             installed_manifest,
@@ -1424,23 +1809,26 @@ def install_norm(
     venv_dir = target / venv_rel
     venv_python = venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
-    if options.recreate_venv and venv_dir.exists():
-        progress(25, "Recreating virtual environment")
-        log(f"Removing existing virtual environment: {venv_dir}")
-        shutil.rmtree(venv_dir)
-
-    if venv_python.is_file():
-        progress(28, "Reusing virtual environment")
+    expected_py = _expected_python(settings)
+    recreate_reason = "operator requested recreation" if options.recreate_venv and venv_dir.exists() else ""
+    if venv_python.is_file() and not recreate_reason:
+        # This is the one installed-venv Python compatibility check in the install path.
         venv_ver = _python_version(venv_python, log)
-        expected_py = _expected_python(settings)
         if expected_py and venv_ver[:2] != expected_py:
-            raise InstallerError(
-                f"Existing venv uses Python {venv_ver[0]}.{venv_ver[1]}.{venv_ver[2]}, "
-                f"but this package expects Python {expected_py[0]}.{expected_py[1]}.x. "
-                "Enable 'Recreate .venv' for this update."
+            recreate_reason = (
+                f"existing venv uses Python {venv_ver[0]}.{venv_ver[1]}.{venv_ver[2]} "
+                f"but package requires {expected_py[0]}.{expected_py[1]}.x"
             )
-        log(f"Reusing existing virtual environment: {venv_dir}")
-    else:
+        else:
+            progress(28, "Reusing virtual environment")
+            log(f"Reusing compatible virtual environment: {venv_dir}")
+
+    if recreate_reason:
+        progress(25, "Recreating virtual environment")
+        log(f"Recreating {venv_dir}: {recreate_reason}")
+        shutil.rmtree(venv_dir, ignore_errors=True)
+
+    if not venv_python.is_file():
         progress(28, "Creating virtual environment")
         _run([str(python_exe), "-m", "venv", str(venv_dir)], cwd=target, log=log)
 
@@ -1464,6 +1852,7 @@ def install_norm(
             log=log,
         )
 
+    protected_exact: dict[str, str] = {}
     if options.install_torch:
         torch_cfg = _configured_torch(settings)
         if torch_cfg:
@@ -1478,49 +1867,40 @@ def install_norm(
                 if index_url:
                     cmd.extend(["--index-url", index_url])
                 _run(cmd, cwd=target, log=log)
+            # Torch is package-configured separately (including its wheel index/local version).
+            # Generic dependency resolution must never silently replace it as a transitive upgrade.
+            protected_exact["torch"] = version
 
     requirements = target / str(manifest["requirements_lock"])
     dependency_mode = (options.dependency_mode or "package").strip().lower()
     if dependency_mode == "package":
-        if _requirements_exactly_satisfied(venv_python, requirements, log):
-            progress(52, "Package requirements already satisfied")
-            log("Every package-locked distribution already matches exactly; skipping pip dependency reconciliation.")
-        else:
-            progress(52, "Installing package requirements")
-            _run(
-                [str(venv_python), "-m", "pip", "install", "--disable-pip-version-check", "-r", str(requirements)],
-                cwd=target,
-                log=log,
-            )
+        progress(52, "Comparing package requirements")
+        dependency_delta = _resolve_pinned_dependency_delta(venv_python, requirements, target, log, protected_exact)
     elif dependency_mode == "newest":
-        progress(52, "Resolving newest available requirements")
-        pins = _exact_requirement_pins(requirements)
-        if not pins:
-            raise InstallerError(f"No exact package requirements were found in {requirements}")
-        requested = sorted(pins)
-        log(
-            "Newest-available mode: resolving the newest non-prerelease releases pip accepts "
-            "for the package's locked distribution set: " + ", ".join(requested)
-        )
-        _run(
-            [str(venv_python), "-m", "pip", "install", "--disable-pip-version-check", "--upgrade", *requested],
-            cwd=target,
-            log=log,
-        )
-        evidence_dir = target / "state" / "installer"
-        evidence_dir.mkdir(parents=True, exist_ok=True)
-        freeze = _run(
-            [str(venv_python), "-m", "pip", "freeze", "--all"],
-            cwd=target,
-            log=log,
-        )
-        (evidence_dir / "resolved-requirements.txt").write_text(
-            freeze.stdout if freeze.stdout.endswith("\n") else freeze.stdout + "\n",
-            encoding="utf-8",
-        )
-        log(f"Recorded resolved environment: {evidence_dir / 'resolved-requirements.txt'}")
+        progress(52, "Resolving newest compatible requirements")
+        dependency_delta = _resolve_newest_dependency_delta(venv_python, requirements, target, log, protected_exact)
     else:
         raise InstallerError(f"Unknown dependency mode: {options.dependency_mode!r}")
+
+    if dependency_delta:
+        progress(58, f"Installing {len(dependency_delta)} dependency change(s)")
+        _install_dependency_delta(venv_python, target, dependency_delta, log)
+    else:
+        progress(58, "Dependencies already compatible")
+        _write_dependency_delta(target, {})
+        log("Existing venv already matches the selected dependency policy; pip install skipped.")
+
+    evidence_dir = _dependency_evidence_dir(target)
+    freeze = _run(
+        [str(venv_python), "-m", "pip", "freeze", "--all"],
+        cwd=target,
+        log=log,
+    )
+    (evidence_dir / "resolved-requirements.txt").write_text(
+        freeze.stdout if freeze.stdout.endswith("\n") else freeze.stdout + "\n",
+        encoding="utf-8",
+    )
+    log(f"Recorded resolved environment: {evidence_dir / 'resolved-requirements.txt'}")
 
     progress(68, "Checking installed environment")
     _run([str(venv_python), "-m", "pip", "check"], cwd=target, log=log)
@@ -2037,11 +2417,12 @@ def _peek_norm_source(path: Path) -> tuple[str, str] | None:
 
 
 def list_local_sources(directory: Path | None = None) -> list[Path]:
-    """Return valid local Norm source ZIPs, highest package version first.
+    """Return valid Norm source ZIPs, highest package version first.
 
-    Local operator packages under .norm-local are considered first and win
-    same-version ties. The .norm-local directory is Git-ignored and is never
-    part of the public release bundle.
+    External packages beside the installer win same-version ties, then private .norm-local
+    packages, then the installer-embedded fallback under resources/.  The embedded package
+    makes a one-file installer self-contained without preventing an operator from placing a
+    newer source ZIP beside it.
     """
     root = Path(directory).resolve() if directory else _source_directory()
     candidates: list[tuple[tuple, int, int, str, Path]] = []
@@ -2049,10 +2430,24 @@ def list_local_sources(directory: Path | None = None) -> list[Path]:
     search_roots: list[tuple[Path, int]] = []
     private_root = root / LOCAL_PRIVATE_DIR
     if private_root.is_dir():
-        search_roots.append((private_root, 1))
-    search_roots.append((root, 0))
+        search_roots.append((private_root, 2))
+    search_roots.append((root, 1))
+    if directory is None:
+        for candidate_root in _candidate_roots():
+            bundled = candidate_root / "resources"
+            if bundled.is_dir() and bundled.resolve() != root.resolve():
+                search_roots.append((bundled, 0))
 
-    for search_root, private_priority in search_roots:
+    seen_roots: set[str] = set()
+    unique_roots: list[tuple[Path, int]] = []
+    for search_root, priority in search_roots:
+        key = os.path.normcase(str(search_root.resolve()))
+        if key in seen_roots:
+            continue
+        seen_roots.add(key)
+        unique_roots.append((search_root, priority))
+
+    for search_root, source_priority in unique_roots:
         for path in search_root.glob("*.zip"):
             if not path.is_file():
                 continue
@@ -2067,7 +2462,7 @@ def list_local_sources(directory: Path | None = None) -> list[Path]:
             candidates.append(
                 (
                     _version_key(version),
-                    private_priority,
+                    source_priority,
                     mtime,
                     path.name.lower(),
                     path.resolve(),
@@ -2079,7 +2474,6 @@ def list_local_sources(directory: Path | None = None) -> list[Path]:
         reverse=True,
     )
     return [item[4] for item in candidates]
-
 
 def find_latest_source(directory: Path | None = None) -> Path | None:
     sources = list_local_sources(directory)
@@ -2935,11 +3329,12 @@ def launch_gui(initial_source: Path | None = None, imprint_path: Path | None = N
             _verify_companion_sha256(selected_source)
             selected_info = inspect_package(selected_source)
             package_var.set(f"{selected_info.label}  •  {selected_source.name}")
-            package_detail_var.set(
-                "✓ Local private package selected from .norm-local  •  ✓ SHA-256 verified"
-                if LOCAL_PRIVATE_DIR in selected_source.parts
-                else "✓ Highest valid public package version found beside installer  •  ✓ SHA-256 verified"
-            )
+            if LOCAL_PRIVATE_DIR in selected_source.parts:
+                package_detail_var.set("✓ Local private package selected from .norm-local  •  ✓ SHA-256 verified")
+            elif selected_source.parent.name.lower() == "resources" and getattr(sys, "frozen", False):
+                package_detail_var.set("✓ Bundled Norm source selected from installer resources  •  ✓ SHA-256 verified")
+            else:
+                package_detail_var.set("✓ Highest valid public package version found beside installer  •  ✓ SHA-256 verified")
             if not python_var.get().strip():
                 default_py = choose_default_python(selected_source)
                 if default_py:
@@ -2972,19 +3367,8 @@ def launch_gui(initial_source: Path | None = None, imprint_path: Path | None = N
             if not looks_norm:
                 raise InstallerError(f"Target is non-empty but does not look like a Norm installation: {target}")
             replace = True
-            try:
-                manifest_path = target / "package-manifest.json"
-                if manifest_path.is_file():
-                    installed_manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-                    settings = _read_settings(target, installed_manifest)
-                    venv_rel = settings.get("environment", "venv_path", fallback=".venv").strip() or ".venv"
-                    existing_py = target / venv_rel / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-                    expected = _expected_python(settings)
-                    if existing_py.is_file() and expected:
-                        existing_ver = _python_version(existing_py, _noop_log)
-                        recreate = existing_ver[:2] != expected
-            except Exception as exc:
-                append_log(f"Existing environment probe was inconclusive; repair path will continue: {exc}")
+            # Do not probe the venv here. install_norm owns the single installed-venv
+            # compatibility decision and recreates it automatically only when necessary.
 
         if not pg_password_var.get().strip():
             raise InstallerError("PostgreSQL password is required.")
@@ -3146,7 +3530,31 @@ def main() -> int:
     if args.self_test_file:
         target = Path(args.self_test_file).expanduser()
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(f"ok {INSTALLER_VERSION} auto-source\n", encoding="utf-8")
+        resources = [
+            _installer_resource("Norm-0.54.3-portable-source.zip"),
+            _installer_resource("Norm-0.54.3-portable-source.zip.sha256"),
+        ]
+        version_cases = {
+            "0.54.2": (0, 54, 2, 0),
+            "0.54.2b": (0, 54, 2, 2),
+            "0.54.2b2": (0, 54, 2, 202),
+            "0.54.2-beta2": (0, 54, 2, 202),
+            "0.54.2rc1": (0, 54, 2, 301),
+            "0.54.2g": (0, 54, 2, 7),
+        }
+        parser_ok = all(_windows_version_tuple(text) == expected for text, expected in version_cases.items())
+        bundled_path = _installer_resource("Norm-0.54.3-portable-source.zip")
+        bundled_info = inspect_package(bundled_path)
+        with zipfile.ZipFile(bundled_path, "r") as zf:
+            bundled_names = set(zf.namelist())
+        listener_ok = "make-listener.bat" in bundled_names and "tools/build_listener.py" in bundled_names
+        legacy_build_absent = "tools/build_norm.py" not in bundled_names and not bundled_info.manifest.get("build_script")
+        target.write_text(
+            f"ok {INSTALLER_VERSION} auto-source listener-builder={listener_ok} "
+            f"version-parser={parser_ok} bundled-source={bundled_info.version} projected-compat=True "
+            f"installer-owned-build={legacy_build_absent}\n",
+            encoding="utf-8",
+        )
         return 0
 
     if args.print_pip_spec:
@@ -3167,14 +3575,14 @@ def main() -> int:
         info = inspect_package(source)
         print(json.dumps({
             "installer_version": INSTALLER_VERSION,
-            "source_selection": "explicit --source" if args.source else "most recently modified local package",
+            "source_selection": "explicit --source" if args.source else "highest valid external/bundled package",
             "source": str(info.source_zip),
             "name": info.name,
             "version": info.version,
             "package_schema": info.manifest.get("package_schema"),
             "entrypoint": info.manifest.get("entrypoint"),
             "requirements_lock": info.manifest.get("requirements_lock"),
-            "build_script": info.manifest.get("build_script"),
+            "build_logic": "installer-owned",
         }, indent=2))
         return 0
 
@@ -3182,10 +3590,13 @@ def main() -> int:
         install_cfg = imprint.get("install", {})
         target_arg = args.target or str(install_cfg.get("target_dir") or "")
         python_arg = args.python_exe or str(install_cfg.get("python_exe") or "")
+        if not python_arg and source:
+            detected = choose_default_python(source)
+            python_arg = str(detected) if detected else ""
         if not source or not target_arg or not python_arg:
             parser.error(
-                "--install requires a local Norm source package plus target/python values "
-                "(from CLI or the non-secret imprint)"
+                "--install requires a local Norm source package and target; Python may be supplied "
+                "explicitly or auto-detected from the system."
             )
         secret_values: dict[str, str] = {}
         for file_arg, key in (
