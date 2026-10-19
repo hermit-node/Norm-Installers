@@ -1517,6 +1517,52 @@ def _install_dependency_delta(
     )
 
 
+def _verify_vision_parse_dependencies(
+    venv_python: Path, target: Path, log: LogFn, warnings: list[str]
+) -> None:
+    """Verify the actual installed cv2/ONNX imports, not just package metadata."""
+    if not (target / "plugins" / "vision_parse" / "plugin.json").is_file():
+        return
+    code = """import json
+import cv2
+import numpy
+import pymupdf
+import PIL
+import pytesseract
+import imageio_ffmpeg
+import onnxruntime as ort
+needed = ('FaceDetectorYN', 'FaceRecognizerSF')
+missing = [name for name in needed if not hasattr(cv2, name)]
+if missing:
+    raise RuntimeError('OpenCV lacks YuNet/SFace APIs: ' + ', '.join(missing))
+print(json.dumps({'opencv': cv2.__version__, 'onnxruntime_providers': ort.get_available_providers()}))
+"""
+    try:
+        cp = subprocess.run(
+            [str(venv_python), "-c", code], cwd=target,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+        )
+    except Exception as exc:
+        raise InstallerError(f"Vision Parse dependency verification failed: {exc}") from exc
+    if cp.returncode:
+        raise InstallerError(
+            "Vision Parse could not import its Python dependencies from Norm's .venv: "
+            + (cp.stderr or cp.stdout or "").strip()[-1600:]
+        )
+    try:
+        info = json.loads(cp.stdout.strip())
+    except Exception as exc:
+        raise InstallerError("Vision Parse dependency verification returned invalid output") from exc
+    providers = info.get("onnxruntime_providers") or []
+    log(f"Vision Parse verified: OpenCV {info['opencv']}, ONNX providers {providers}")
+    if "CUDAExecutionProvider" not in providers:
+        message = "Vision Parse CUDA provider not available; OpenCV CPU fallback remains usable."
+        warnings.append(message)
+        log(f"WARNING: {message}")
+
+
 def _external_path(settings: configparser.ConfigParser, key: str, default: str) -> Path:
     raw_docs = settings.get("paths", "documents_root", fallback="").strip()
     docs = Path(_expand_windows_vars(raw_docs)).expanduser() if raw_docs else (Path.home() / "Documents" / "Norm")
@@ -2093,6 +2139,7 @@ def install_norm(
 
     progress(68, "Checking installed environment")
     _run([str(venv_python), "-m", "pip", "check"], cwd=target, log=log)
+    _verify_vision_parse_dependencies(venv_python, target, log, warnings)
     source_dir = target / str(manifest.get("source_dir", "core"))
     tools_dir = target / "tools"
     _run(
