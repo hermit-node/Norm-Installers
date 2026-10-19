@@ -1,15 +1,17 @@
 @echo off
-setlocal
-cd /d "%~dp0"
-set "SOURCE=%~dp0Norm-0.53.20-portable-source.zip"
-if exist "%~dp0dist\Norm-Installer.exe" (
-  "%~dp0dist\Norm-Installer.exe" --source "%SOURCE%"
-  exit /b %errorlevel%
-)
-where py >nul 2>&1
-if %errorlevel%==0 (
-  py -3 "%~dp0Norm-Installer.py" --source "%SOURCE%"
-) else (
-  python "%~dp0Norm-Installer.py" --source "%SOURCE%"
-)
+setlocal EnableExtensions
+cd /d "%~dp0" || exit /b 1
+
+if exist "%~dp0Norm-Installer.exe" goto :compiled
+where py >nul 2>nul
+if errorlevel 1 goto :python
+py -3.14 "%~dp0Norm-Installer.py" %*
+exit /b %errorlevel%
+
+:python
+python "%~dp0Norm-Installer.py" %*
+exit /b %errorlevel%
+
+:compiled
+"%~dp0Norm-Installer.exe" %*
 exit /b %errorlevel%

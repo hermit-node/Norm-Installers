@@ -1,5 +1,5 @@
-﻿from __future__ import annotations
-import argparse, hashlib, subprocess, sys
+from __future__ import annotations
+import argparse, hashlib, os, shutil, subprocess, sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent
 SPEC=ROOT/'Norm-Installer.spec'
@@ -22,4 +22,15 @@ def main():
     print(f'REFERENCE={EXPECTED}')
     print('REFERENCE_MATCH='+str(digest==EXPECTED))
     if args.verify_reference and digest!=EXPECTED: raise SystemExit(2)
+    # Publish a launchable EXE beside the source/package discovery roots.
+    # The PyInstaller dist/ output is retained; no second build is performed.
+    staged=ROOT/'Norm-Installer.exe.staging'
+    target=ROOT/'Norm-Installer.exe'
+    try:
+        shutil.copy2(exe,staged)
+        if sha256(staged)!=digest: raise SystemExit('Staged installer checksum mismatch')
+        os.replace(staged,target)
+    finally:
+        staged.unlink(missing_ok=True)
+    print(f'LAUNCHABLE_EXE={target}')
 if __name__=='__main__': main()

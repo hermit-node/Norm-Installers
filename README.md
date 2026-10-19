@@ -1,5 +1,15 @@
 # Norm Installer 1.6.17
 
+## Build and launch from this source tree
+
+- Run `Build-Norm-Installer-EXE.bat` to compile the installer using Windows Python 3.14 and PyInstaller.
+- Run `Run-Norm-Installer.bat` to launch the compiled installer, or the Python source if no built EXE exists.
+- `Build-Installer.bat` and `Run-Installer.bat` remain equivalent short-name entry points.
+- A successful build retains `dist/Norm-Installer.exe` and stages `Norm-Installer.exe` alongside the launcher so sibling source ZIP and `Src/` discovery works.
+- The runner no longer forces the obsolete 0.53.20 source ZIP; supply `--source PATH` to override automatic ZIP/folder selection.
+- `.gitignore` excludes Python bytecode, build directories, and generated installer EXEs. `.gitattributes` standardizes BAT line endings.
+- Git tags v1.6.11, v1.6.12-initial, and v1.6.12 represent recovered historical source snapshots. They intentionally retain their original incomplete set of helper files.
+
 Installer-owned Norm compilation is restored from the tested 1.6.12-unified
 install-kit implementation. This fixes the 1.6.16 regression that incorrectly
 required a build_script inside the source ZIP package manifest.
