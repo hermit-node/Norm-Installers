@@ -233,11 +233,11 @@ def resolve_environment_prefill(
         explicit = nested_has(raw_imprint, dotted)
         imprint_value = nested_get(imprint, dotted, default)
         if dotted in current:
-            current_value = current[dotted]
-            if explicit and current_value == default:
-                value, origin = imprint_value, "imprint"
-            else:
-                value, origin = current_value, "current"
+            # A persisted local imprint is auto-fill data, NOT proof of a fresh
+            # user edit. Never replace installed machine settings with defaults
+            # merely because the old value matches a generic default.
+            # Actual installer edits are made to the GUI fields *after* prefill.
+            value, origin = current[dotted], "current"
         elif explicit:
             value, origin = imprint_value, "imprint"
         else:

@@ -1,5 +1,28 @@
 # Norm Installer 1.6.17
 
+## 1.6.17 compatibility repair (2026-10-19)
+
+This revision preserves the distinct KHzz 1.6.17 changes (lean runtime freeze,
+opt-in cache cleaning) and integrates the GitHub repair-branch changes.
+The previous KHzz state is preserved as tag v1.6.17-khzz-pre-repair.
+
+- Preserve installed host/port/path values when prefilling the installer;
+  a saved full imprint is not itself evidence of a newly entered override.
+- Prefer core/requirements.txt over legacy requirements-lock.txt.
+- Default GUI mode: resolve newest mutually compatible dependencies.
+  Alternate GUI mode: follow versions and constraints in requirements.txt.
+- Reconcile installed plugin requirements.txt files and older built-in plugin
+  runtime requirements, including vision_parse and GUI/browser plugins.
+- Restore whole-venv inventory, compatibility dry-run, projected compatibility
+  verification and delta-only installation from the 1.6.12 dependency logic.
+- Protect the configured PyTorch/CUDA wheel from generic dependency upgrades.
+- Verify Vision Parse OpenCV face APIs and ONNX Runtime imports before freezing;
+  report missing ONNX CUDA provider while preserving CPU fallback.
+
+Validation: Python compilation, focused tests, source-selection and builder
+regression scripts passed in a temporary merge worktree. No full fresh-machine
+Norm installation or ONNX CUDA inference smoke was performed.
+
 ## Build and launch from this source tree
 
 - Run `Build-Norm-Installer-EXE.bat` to compile the installer using Windows Python 3.14 and PyInstaller. It **reuses PyInstaller's build cache** by default; add `--clean` only if a stale/corrupted cache requires a clean rebuild.
