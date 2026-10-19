@@ -1146,7 +1146,7 @@ def _requirements_from_source(target: Path, manifest: dict, log: LogFn) -> list[
     # Include their known runtime wheels until all deployed packages declare them.
     # Never override an explicit version constraint from core or a plugin.
     legacy_plugin_requirements = {
-        "vision_parse": ("opencv-python", "onnxruntime-gpu", "imageio-ffmpeg",
+        "vision_parse": ("opencv-python", "imageio-ffmpeg",
                          "numpy", "pillow", "pytesseract", "PyMuPDF"),
         "desktop_gui": ("pywinauto", "mss", "pywin32", "comtypes"),
         "shared_browser": ("PySide6", "reportlab", "mss", "Pillow", "playwright"),
@@ -1555,12 +1555,16 @@ import pymupdf
 import PIL
 import pytesseract
 import imageio_ffmpeg
-import onnxruntime as ort
+try:
+    import onnxruntime as ort  # Optional, only explicit CUDA backend uses it.
+    ort_providers = ort.get_available_providers()
+except (ImportError, OSError):
+    ort_providers = []
 needed = ('FaceDetectorYN', 'FaceRecognizerSF')
 missing = [name for name in needed if not hasattr(cv2, name)]
 if missing:
     raise RuntimeError('OpenCV lacks YuNet/SFace APIs: ' + ', '.join(missing))
-print(json.dumps({'opencv': cv2.__version__, 'onnxruntime_providers': ort.get_available_providers()}))
+print(json.dumps({'opencv': cv2.__version__, 'onnxruntime_providers': ort_providers}))
 """
     try:
         cp = subprocess.run(
@@ -1582,10 +1586,8 @@ print(json.dumps({'opencv': cv2.__version__, 'onnxruntime_providers': ort.get_av
         raise InstallerError("Vision Parse dependency verification returned invalid output") from exc
     providers = info.get("onnxruntime_providers") or []
     log(f"Vision Parse verified: OpenCV {info['opencv']}, ONNX providers {providers}")
-    if "CUDAExecutionProvider" not in providers:
-        message = "Vision Parse CUDA provider not available; OpenCV CPU fallback remains usable."
-        warnings.append(message)
-        log(f"WARNING: {message}")
+    # CPU OpenCV is the default; an absent CUDA provider is not an install warning.
+    log("Vision Parse default: OpenCV CPU. CUDA provider is optional on explicit request.")
 
 
 def _external_path(settings: configparser.ConfigParser, key: str, default: str) -> Path:

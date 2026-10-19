@@ -56,7 +56,7 @@ class RequirementRepairTests(unittest.TestCase):
                 installer._newest_requirement_names(specs).count("psycopg[binary]"), 1
             )
 
-    def test_vision_parse_legacy_package_gets_onnx_cuda_opencv(self):
+    def test_vision_parse_legacy_package_uses_cpu_without_gpu_requirement(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "core").mkdir()
@@ -67,8 +67,9 @@ class RequirementRepairTests(unittest.TestCase):
             specs = installer._requirements_from_source(
                 root, {"source_dir": "core"}, lambda _: None
             )
-            for name in ("onnxruntime-gpu", "opencv-python", "imageio-ffmpeg", "PyMuPDF"):
+            for name in ("opencv-python", "imageio-ffmpeg", "PyMuPDF"):
                 self.assertIn(name, specs)
+            self.assertNotIn("onnxruntime-gpu", specs)
             self.assertNotIn("opencv-contrib-python", specs)
             self.assertNotIn("opencv-python-headless", specs)
 
@@ -115,7 +116,7 @@ class RequirementRepairTests(unittest.TestCase):
             self.assertEqual(out["install"], [])
 
 
-    def test_vision_parse_import_check_warns_when_cuda_not_advertised(self):
+    def test_vision_parse_import_check_accepts_cpu_without_cuda(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             plugin = root / "plugins" / "vision_parse"
@@ -130,8 +131,7 @@ class RequirementRepairTests(unittest.TestCase):
                     Path("python"), root, lambda _: None, warnings
                 )
                 self.assertTrue(run.called)
-            self.assertEqual(len(warnings), 1)
-            self.assertIn("CUDA provider", warnings[0])
+            self.assertEqual(warnings, [])
 
     def test_vision_parse_import_check_rejects_missing_packages(self):
         with tempfile.TemporaryDirectory() as td:
