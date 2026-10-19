@@ -29,10 +29,15 @@ with tempfile.TemporaryDirectory(prefix="norm-installer-launcher-") as td:
     payload = b"MZ dummy executable bytes"
 
     seen=[]
-    def fake_pyinstaller(args, *, cwd, check):
+    workpaths=[]
+    def fake_pyinstaller(args, *, cwd, check, env):
         assert args[1:4] == ["-m", "PyInstaller", "--noconfirm"]
         assert args[-1] == str(root / "Norm-Installer.spec")
         assert args[args.index("--distpath") + 1] == str(root)
+        work = Path(args[args.index("--workpath") + 1])
+        assert work.is_dir() and work.name.startswith("norm-installer-build-")
+        assert env["PYTHONDONTWRITEBYTECODE"] == "1"
+        workpaths.append(work)
         seen.append(args)
         assert cwd == root and check
         output = root / "Norm-Installer.exe"
@@ -46,6 +51,7 @@ with tempfile.TemporaryDirectory(prefix="norm-installer-launcher-") as td:
         mod.main()
 
     assert len(seen) == 1 and "--clean" not in seen[0]
+    assert len(workpaths) == 1 and not workpaths[0].exists()
     assert (root / "Norm-Installer.exe").read_bytes() == payload
     assert not (root / "dist" / "Norm-Installer.exe").exists()
     assert not (root / "dist").exists()
@@ -54,6 +60,25 @@ with tempfile.TemporaryDirectory(prefix="norm-installer-launcher-") as td:
     with patch.object(mod, "ROOT", root), patch.object(mod, "SPEC", root / "Norm-Installer.spec"),          patch.object(mod.subprocess, "run", side_effect=fake_pyinstaller),          patch.object(sys, "argv", ["Build-Installer.py", "--clean"]):
         mod.main()
     assert len(seen) == 2 and "--clean" in seen[1]
+    assert len(workpaths) == 2 and all(not work.exists() for work in workpaths)
+
+    # A failed build must also remove the work files and preserve an existing EXE.
+    def failed_pyinstaller(args, *, cwd, check, env):
+        work = Path(args[args.index("--workpath") + 1])
+        assert work.is_dir()
+        workpaths.append(work)
+        raise subprocess.CalledProcessError(3, args)
+    with patch.object(mod, "ROOT", root), patch.object(mod, "SPEC", root / "Norm-Installer.spec"), \
+         patch.object(mod.subprocess, "run", side_effect=failed_pyinstaller), \
+         patch.object(sys, "argv", ["Build-Installer.py"]):
+        try:
+            mod.main()
+        except subprocess.CalledProcessError:
+            pass
+        else:
+            raise AssertionError("Failed build must propagate an error")
+    assert len(workpaths) == 3 and not workpaths[-1].exists()
+    assert (root / "Norm-Installer.exe").read_bytes() == payload
 
 print("PASS installer BAT compatibility, automatic source selection, ignored artifacts")
-print("PASS one installer EXE beside launcher, no dist duplicate, cache reusable")
+print("PASS single EXE, disposable workpath cleaned on success/failure, no dist duplicate")

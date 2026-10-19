@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, hashlib, subprocess, sys
+import argparse, hashlib, os, subprocess, sys, tempfile
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent
 SPEC=ROOT/'Norm-Installer.spec'
@@ -14,12 +14,16 @@ def main():
     ap.add_argument('--verify-reference',action='store_true')
     ap.add_argument('--clean',action='store_true',help='Explicitly discard the PyInstaller build cache')
     args=ap.parse_args()
-    # One build output, directly beside Build-Installer.bat; reuse PyInstaller work cache.
-    command=[sys.executable,'-m','PyInstaller','--noconfirm','--distpath',str(ROOT)]
-    if args.clean:
-        command.append('--clean')
-    command.append(str(SPEC))
-    subprocess.run(command,cwd=ROOT,check=True)
+    # Keep one published EXE and make all PyInstaller work files disposable.
+    # The temp workpath prevents reuse and is removed on success or failure.
+    with tempfile.TemporaryDirectory(prefix='norm-installer-build-') as work:
+        command=[sys.executable,'-m','PyInstaller','--noconfirm',
+                 '--distpath',str(ROOT),'--workpath',work]
+        if args.clean:  # Optional global PyInstaller cache purge, not required.
+            command.append('--clean')
+        command.append(str(SPEC))
+        subprocess.run(command,cwd=ROOT,check=True,
+                       env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1'})
     exe=ROOT/'Norm-Installer.exe'
     if not exe.is_file(): raise SystemExit('Build completed but Norm-Installer.exe is missing beside the build scripts')
     digest=sha256(exe)
