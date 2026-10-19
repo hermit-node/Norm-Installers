@@ -21,7 +21,7 @@ from typing import Any, Callable, Iterable
 
 import installer_environment as envtools
 
-INSTALLER_VERSION = "1.6.11-unified"
+INSTALLER_VERSION = "1.6.12-unified"
 PIP_VERSION = "26.2.1"
 PIP_MIN_VERSION = PIP_VERSION  # backward-compatible internal print helper
 PIP_SPEC = f"pip=={PIP_VERSION}"
@@ -1361,6 +1361,7 @@ def install_norm(
             "backups",
             ".env",
             ".norm-install-state.json",
+            "config/plugins.ini",
             "tools/weasyprint/runtime",
         }
 
