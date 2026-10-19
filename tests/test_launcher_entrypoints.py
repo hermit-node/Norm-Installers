@@ -32,19 +32,23 @@ with tempfile.TemporaryDirectory(prefix="norm-installer-launcher-") as td:
     def fake_pyinstaller(args, *, cwd, check):
         assert args[1:4] == ["-m", "PyInstaller", "--noconfirm"]
         assert args[-1] == str(root / "Norm-Installer.spec")
+        assert args[args.index("--distpath") + 1] == str(root)
         seen.append(args)
         assert cwd == root and check
-        output = root / "dist" / "Norm-Installer.exe"
-        output.parent.mkdir(parents=True, exist_ok=True)
+        output = root / "Norm-Installer.exe"
         output.write_bytes(payload)
         return subprocess.CompletedProcess(args=args, returncode=0)
 
+    # Simulate the old builder's obsolete second copy.
+    (root / "dist").mkdir()
+    (root / "dist" / "Norm-Installer.exe").write_bytes(b"old duplicate")
     with patch.object(mod, "ROOT", root), patch.object(mod, "SPEC", root / "Norm-Installer.spec"),          patch.object(mod.subprocess, "run", side_effect=fake_pyinstaller),          patch.object(sys, "argv", ["Build-Installer.py"]):
         mod.main()
 
     assert len(seen) == 1 and "--clean" not in seen[0]
     assert (root / "Norm-Installer.exe").read_bytes() == payload
-    assert (root / "dist" / "Norm-Installer.exe").read_bytes() == payload
+    assert not (root / "dist" / "Norm-Installer.exe").exists()
+    assert not (root / "dist").exists()
     assert not (root / "Norm-Installer.exe.staging").exists()
 
     with patch.object(mod, "ROOT", root), patch.object(mod, "SPEC", root / "Norm-Installer.spec"),          patch.object(mod.subprocess, "run", side_effect=fake_pyinstaller),          patch.object(sys, "argv", ["Build-Installer.py", "--clean"]):
@@ -52,4 +56,4 @@ with tempfile.TemporaryDirectory(prefix="norm-installer-launcher-") as td:
     assert len(seen) == 2 and "--clean" in seen[1]
 
 print("PASS installer BAT compatibility, automatic source selection, ignored artifacts")
-print("PASS single-build candidate published beside launcher, with matching hashes")
+print("PASS one installer EXE beside launcher, no dist duplicate, cache reusable")
