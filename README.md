@@ -163,4 +163,4 @@ for the full story.
 
 ## Browse all installer versions
 
-The complete source snapshot tree is in versions/README.md. Original release tags and historical commits are preserved. Source-only 1.6.11 and 1.6.12 revisions were added without compiled executables or bundled Norm source ZIPs.
+Installer versions are preserved by Git tags, not duplicate source directories. Source-only recoveries are tagged v1.6.11, v1.6.12-initial (pre-correction), and v1.6.12 (corrected). These tags do not imply newly compiled binaries. For an archived source file, use: git show v1.6.11:Norm-Installer.py. To export the recovered source, use: git archive --format=zip --output=Norm-Installer-1.6.11-source.zip v1.6.11. Published executable builds belong on GitHub Releases, not inside the source tree.
