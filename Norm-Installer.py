@@ -1048,58 +1048,456 @@ def _sync_tree_contents(
     return stats
 
 
-def _installed_version(python_exe: Path, distribution: str, log: LogFn) -> str | None:
-    code = (
-        "import importlib.metadata as m; "
-        f"print(m.version({distribution!r}))"
-    )
+def _canonical_dist_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", str(name).strip()).lower()
+
+
+def _installed_versions(python_exe: Path, distributions: Iterable[str]) -> dict[str, str]:
+    """Read all requested installed versions in one interpreter invocation."""
+    requested = sorted({_canonical_dist_name(name): str(name) for name in distributions}.items())
+    if not requested:
+        return {}
+    names = [original for _, original in requested]
+    code = """import importlib.metadata as m, json, sys
+names = json.loads(sys.argv[1])
+out = {}
+for name in names:
+    try:
+        out[name] = m.version(name)
+    except m.PackageNotFoundError:
+        out[name] = None
+print(json.dumps(out, sort_keys=True))
+"""
     try:
         cp = subprocess.run(
-            [str(python_exe), "-c", code],
+            [str(python_exe), "-c", code, json.dumps(names)],
             cwd=None,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=15,
+            timeout=30,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
         )
-    except Exception:
-        return None
-    if cp.returncode != 0:
-        return None
-    value = (cp.stdout or "").strip().splitlines()
-    return value[-1].strip() if value else None
-
-
-def _exact_requirement_pins(requirements: Path) -> dict[str, str]:
-    pins: dict[str, str] = {}
-    for raw in requirements.read_text(encoding="utf-8-sig").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        match = re.fullmatch(r"([A-Za-z0-9_.-]+)==([^;\s]+)(?:\s*;.*)?", line)
-        if not match:
+        if cp.returncode != 0:
             return {}
-        pins[match.group(1)] = match.group(2)
-    return pins
+        raw = json.loads((cp.stdout or "{}").strip() or "{}")
+    except Exception:
+        return {}
+    return {_canonical_dist_name(name): str(version) for name, version in raw.items() if version}
+
+def _installed_version(python_exe: Path, distribution: str, log: LogFn) -> str | None:
+    # Compatibility wrapper for single-package checks such as pip/PyTorch.
+    return _installed_versions(python_exe, [distribution]).get(_canonical_dist_name(distribution))
 
 
-def _requirements_exactly_satisfied(python_exe: Path, requirements: Path, log: LogFn) -> bool:
-    pins = _exact_requirement_pins(requirements)
-    if not pins:
-        return False
-    mismatched: list[str] = []
-    for name, expected in pins.items():
-        installed = _installed_version(python_exe, name, log)
-        if installed != expected:
-            mismatched.append(f"{name}: installed={installed or 'missing'} expected={expected}")
-    if mismatched:
-        log("Pinned dependency reconciliation required: " + "; ".join(mismatched[:12]))
-        if len(mismatched) > 12:
-            log(f"... and {len(mismatched) - 12} more mismatch(es)")
-        return False
-    return True
+def _requirements_from_source(target: Path, manifest: dict, log: LogFn) -> list[str]:
+    """Use the source requirements.txt; add requirements from installed plugin folders."""
+    source_dir = target / str(manifest.get("source_dir", "core"))
+    requirements = source_dir / "requirements.txt"
+    if not requirements.is_file():
+        # Backward-compatible input for old Norm source ZIPs without requirements.txt.
+        requirements = target / str(manifest["requirements_lock"])
+        log(f"Legacy package has no core/requirements.txt; using {requirements.name}.")
+    sources = [requirements]
+    plugin_root = target / "plugins"
+    if plugin_root.is_dir():
+        for folder in sorted(plugin_root.iterdir(), key=lambda p: p.name.casefold()):
+            if folder.is_dir() and not folder.is_symlink():
+                candidate = folder / "requirements.txt"
+                if candidate.is_file() and not candidate.is_symlink():
+                    sources.append(candidate)
+    specs: list[str] = []
+    for path in sources:
+        for lineno, raw in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+            line = raw.strip().split(" #", 1)[0].strip()
+            if not line or line.startswith("#"):
+                continue
+            match = re.match(r"^([A-Za-z0-9][A-Za-z0-9_.-]*)(?:\[[A-Za-z0-9_,.-]+\])?", line)
+            if not match or line[match.end():].lstrip()[:1] not in ("", "=", "<", ">", "~", "!", ";"):
+                raise InstallerError(f"Unsupported requirement at {path}:{lineno}: {line!r}")
+            specs.append(line)
+    if not specs:
+        raise InstallerError("Norm and its installed plugins specify no Python requirements.")
+    declared = {_canonical_dist_name(_requirement_name(spec)) for spec in specs}
+    # The compiler is installer infrastructure and is required for fresh installs.
+    if "pyinstaller" not in declared:
+        specs.append("PyInstaller>=6")
+    # Older Vision Parse packages did not ship their own requirements.txt.
+    # Supply only absent declarations; core/requirements.txt pins still take precedence.
+    if (plugin_root / "vision_parse" / "plugin.json").is_file():
+        for name in ("opencv-python", "onnxruntime-gpu", "imageio-ffmpeg",
+                     "numpy", "pillow", "pytesseract", "PyMuPDF"):
+            if _canonical_dist_name(name) not in declared:
+                specs.append(name)
+                declared.add(_canonical_dist_name(name))
+    log(f"Collected {len(specs)} dependency declarations from {len(sources)} requirements.txt file(s), including installed plugins.")
+    return specs
+
+
+def _requirement_name(spec: str) -> str:
+    match = re.match(r"^([A-Za-z0-9][A-Za-z0-9_.-]*)", spec)
+    if not match:
+        raise InstallerError(f"Invalid named requirement: {spec!r}")
+    return match.group(1)
+
+
+def _newest_requirement_names(specs: list[str]) -> list[str]:
+    # Preserve extras such as psycopg[binary] when discarding source version pins.
+    selected: dict[str, str] = {}
+    for spec in specs:
+        match = re.match(r"^([A-Za-z0-9][A-Za-z0-9_.-]*)(\[[A-Za-z0-9_,.-]+\])?", spec)
+        assert match is not None
+        key = _canonical_dist_name(match.group(1))
+        value = match.group(1) + (match.group(2) or "")
+        if key not in selected or ("[" in value and "[" not in selected[key]):
+            selected[key] = value
+    return sorted(selected.values(), key=_canonical_dist_name)
+
+
+def _specs_already_satisfied(venv_python: Path, specs: list[str], inventory: dict[str, Any]) -> bool:
+    # Evaluate PEP 508 requirements using packaging from the selected venv.
+    # Extras are resolved with pip rather than guessed from package-name presence.
+    path = _dependency_evidence_dir  # Referenced only to avoid rebuilding the inventory.
+    del path
+    installed = {name: str(row.get("version") or "") for name, row in (inventory.get("records") or {}).items()}
+    code = r"""import json,sys,re
+try:
+ from packaging.requirements import Requirement
+ from packaging.markers import default_environment
+except ImportError:
+ from pip._vendor.packaging.requirements import Requirement
+ from pip._vendor.packaging.markers import default_environment
+data=json.loads(sys.argv[1]); installed=data["installed"]
+for raw in data["specs"]:
+ req=Requirement(raw)
+ if req.marker is not None and not req.marker.evaluate(default_environment()):
+  continue
+ key=re.sub(r"[-_.]+","-",req.name).lower()
+ ver=installed.get(key)
+ if not ver or req.extras or (req.specifier and not req.specifier.contains(ver,prereleases=True)):
+  print("no");break
+else:
+ print("yes")
+"""
+    cp = subprocess.run([str(venv_python), "-c", code, json.dumps({"specs": specs, "installed": installed})],
+                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
+    return cp.returncode == 0 and cp.stdout.strip() == "yes"
+
+
+def _dependency_evidence_dir(target: Path) -> Path:
+    path = target / "state" / "installer"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _write_dependency_delta(target: Path, delta: dict[str, str]) -> Path:
+    path = _dependency_evidence_dir(target) / "dependency-delta.txt"
+    lines = [f"{name}=={version}" for name, version in sorted(delta.items(), key=lambda item: _canonical_dist_name(item[0]))]
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8", newline="\n")
+    return path
+
+
+def _inventory_installed_environment(
+    venv_python: Path,
+    managed_names: Iterable[str],
+    target: Path,
+    log: LogFn,
+    protected_exact: dict[str, str] | None = None,
+) -> tuple[dict[str, Any], Path]:
+    """Inventory the venv once and derive constraints from packages Norm does not manage.
+
+    Those constraints keep an older/unrelated package already present in the same venv from
+    being silently broken by a newer Norm-managed dependency. Nothing is installed here.
+    """
+    managed = sorted({_canonical_dist_name(name) for name in managed_names})
+    code = r"""import importlib.metadata as md, json, re, sys
+try:
+    from packaging.requirements import Requirement
+    from packaging.markers import default_environment
+except Exception:
+    from pip._vendor.packaging.requirements import Requirement
+    from pip._vendor.packaging.markers import default_environment
+
+def canon(name):
+    return re.sub(r"[-_.]+", "-", str(name).strip()).lower()
+
+managed = set(json.loads(sys.argv[1]))
+env = default_environment(); env["extra"] = ""
+records = {}
+constraints = set()
+parse_errors = []
+for dist in md.distributions():
+    name = str(dist.metadata.get("Name") or "").strip()
+    version = str(dist.version or "").strip()
+    if not name or not version:
+        continue
+    key = canon(name)
+    requires = list(dist.requires or [])
+    records[key] = {"name": name, "version": version, "requires": requires}
+    if key in managed:
+        continue
+    for raw in requires:
+        try:
+            req = Requirement(raw)
+            if req.marker is not None and not req.marker.evaluate(env):
+                continue
+            if req.url or not str(req.specifier):
+                continue
+            constraints.add(f"{req.name}{req.specifier}")
+        except Exception as exc:
+            parse_errors.append({"owner": name, "requirement": raw, "error": str(exc)})
+print(json.dumps({"records": records, "constraints": sorted(constraints), "parse_errors": parse_errors}, sort_keys=True))
+"""
+    cp = subprocess.run(
+        [str(venv_python), "-c", code, json.dumps(managed)],
+        cwd=None,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+    )
+    if cp.returncode != 0:
+        raise InstallerError(f"Could not inventory installed dependency metadata: {(cp.stderr or cp.stdout or '').strip()}")
+    try:
+        payload = json.loads((cp.stdout or "{}").strip() or "{}")
+    except Exception as exc:
+        raise InstallerError(f"Could not parse installed dependency inventory: {exc}") from exc
+
+    evidence = _dependency_evidence_dir(target)
+    inventory_path = evidence / "installed-environment.json"
+    inventory_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+    constraints_path = evidence / "compatibility-constraints.txt"
+    constraints = [str(item).strip() for item in payload.get("constraints") or [] if str(item).strip()]
+    protected = {
+        _canonical_dist_name(name): str(version).strip()
+        for name, version in (protected_exact or {}).items()
+        if str(name).strip() and str(version).strip()
+    }
+    if protected:
+        records = payload.get("records") or {}
+        for canonical, version in sorted(protected.items()):
+            record = records.get(canonical) or {}
+            installed = str(record.get("version") or "").strip()
+            if installed and installed != version:
+                raise InstallerError(
+                    f"Protected dependency {canonical} is {installed}, expected {version}; "
+                    "reconcile the special dependency before generic resolution."
+                )
+            constraints.append(f"{canonical}=={version}")
+    constraints = sorted(set(constraints), key=str.casefold)
+    constraints_path.write_text("\n".join(constraints) + ("\n" if constraints else ""), encoding="utf-8", newline="\n")
+    log(
+        f"Inventoried {len(payload.get('records') or {})} installed distributions once; "
+        f"derived {len(constraints)} compatibility constraint(s), including "
+        f"{len(protected)} installer-protected exact version(s)."
+    )
+    parse_errors = payload.get("parse_errors") or []
+    if parse_errors:
+        log(f"WARNING: {len(parse_errors)} installed requirement metadata line(s) could not be parsed; recorded in {inventory_path}.")
+    return payload, constraints_path
+
+
+def _pip_dry_run_report(
+    venv_python: Path,
+    target: Path,
+    requested: list[str],
+    constraints_path: Path,
+    report_name: str,
+    log: LogFn,
+    *, upgrade: bool = True,
+) -> dict[str, Any]:
+    report = _dependency_evidence_dir(target) / report_name
+    report.unlink(missing_ok=True)
+    cmd = [str(venv_python), "-m", "pip", "install", "--disable-pip-version-check"]
+    if upgrade:
+        cmd.extend(["--upgrade", "--upgrade-strategy", "eager"])
+    cmd.extend(["--dry-run", "--report", str(report)])
+    if constraints_path.is_file() and constraints_path.stat().st_size:
+        cmd.extend(["--constraint", str(constraints_path)])
+    cmd.extend(requested)
+    _run(cmd, cwd=target, log=log)
+    if not report.is_file():
+        raise InstallerError("pip resolver did not produce its compatibility report")
+    try:
+        return json.loads(report.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        raise InstallerError(f"Could not read pip resolver report: {exc}") from exc
+
+
+def _report_delta(payload: dict[str, Any]) -> dict[str, str]:
+    delta: dict[str, str] = {}
+    for item in payload.get("install") or []:
+        meta = item.get("metadata") or {}
+        name = str(meta.get("name") or "").strip()
+        version = str(meta.get("version") or "").strip()
+        if name and version:
+            delta[name] = version
+    return delta
+
+
+def _check_projected_environment_compatibility(
+    venv_python: Path,
+    inventory: dict[str, Any],
+    resolver_report: dict[str, Any],
+    target: Path,
+    log: LogFn,
+) -> None:
+    """Check the complete projected venv before any dependency change is installed.
+
+    pip resolves the requested Norm graph while compatibility constraints preserve the needs of
+    unrelated installed packages. This second in-memory check overlays the proposed candidates
+    on every installed distribution and evaluates Requires-Dist metadata. It is verification,
+    not another resolver invocation.
+    """
+    evidence = _dependency_evidence_dir(target)
+    input_path = evidence / "projected-environment-input.json"
+    result_path = evidence / "projected-environment-check.json"
+    payload = {"inventory": inventory, "resolver_report": resolver_report}
+    input_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+
+    code = r"""import json, re, sys
+try:
+    from packaging.requirements import Requirement
+    from packaging.version import Version
+    from packaging.markers import default_environment
+except Exception:
+    from pip._vendor.packaging.requirements import Requirement
+    from pip._vendor.packaging.version import Version
+    from pip._vendor.packaging.markers import default_environment
+
+def canon(name):
+    return re.sub(r"[-_.]+", "-", str(name).strip()).lower()
+
+data = json.load(open(sys.argv[1], "r", encoding="utf-8-sig"))
+records = dict((data.get("inventory") or {}).get("records") or {})
+projected = {key: str(value.get("version") or "") for key, value in records.items()}
+requirements_by_owner = {key: list(value.get("requires") or []) for key, value in records.items()}
+owners = {key: str(value.get("name") or key) for key, value in records.items()}
+
+for item in (data.get("resolver_report") or {}).get("install") or []:
+    meta = item.get("metadata") or {}
+    name = str(meta.get("name") or "").strip()
+    version = str(meta.get("version") or "").strip()
+    if not name or not version:
+        continue
+    key = canon(name)
+    projected[key] = version
+    owners[key] = name
+    requirements_by_owner[key] = list(meta.get("requires_dist") or [])
+
+env = default_environment(); env["extra"] = ""
+conflicts = []
+parse_errors = []
+for owner_key, reqs in requirements_by_owner.items():
+    owner = owners.get(owner_key, owner_key)
+    for raw in reqs:
+        try:
+            req = Requirement(raw)
+            if req.marker is not None and not req.marker.evaluate(env):
+                continue
+            dep_key = canon(req.name)
+            dep_version = projected.get(dep_key)
+            if dep_version is None:
+                conflicts.append({"owner": owner, "requirement": raw, "problem": "missing dependency"})
+                continue
+            if req.specifier and not req.specifier.contains(Version(dep_version), prereleases=True):
+                conflicts.append({"owner": owner, "requirement": raw, "installed_or_proposed": dep_version, "problem": "version conflict"})
+        except Exception as exc:
+            parse_errors.append({"owner": owner, "requirement": raw, "error": str(exc)})
+result = {"ok": not conflicts, "projected_versions": projected, "conflicts": conflicts, "parse_errors": parse_errors}
+print(json.dumps(result, sort_keys=True))
+"""
+    cp = subprocess.run(
+        [str(venv_python), "-c", code, str(input_path)],
+        cwd=target,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+    )
+    if cp.returncode != 0:
+        raise InstallerError(f"Projected dependency compatibility check failed to execute: {(cp.stderr or cp.stdout or '').strip()}")
+    try:
+        result = json.loads((cp.stdout or "{}").strip() or "{}")
+    except Exception as exc:
+        raise InstallerError(f"Could not parse projected compatibility result: {exc}") from exc
+    result_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+    conflicts = result.get("conflicts") or []
+    if conflicts:
+        sample = "; ".join(
+            f"{item.get('owner')}: {item.get('requirement')} (projected {item.get('installed_or_proposed', 'missing')})"
+            for item in conflicts[:8]
+        )
+        raise InstallerError(
+            f"Newest dependency proposal would break {len(conflicts)} installed requirement(s); no dependency changes were made. "
+            f"{sample}. Full evidence: {result_path}"
+        )
+    parse_errors = result.get("parse_errors") or []
+    if parse_errors:
+        log(f"WARNING: projected compatibility check could not parse {len(parse_errors)} metadata requirement(s); details recorded in {result_path}.")
+    log(f"Projected full-venv compatibility passed before install ({len(result.get('projected_versions') or {})} distributions checked).")
+
+
+def _resolve_package_dependency_delta(
+    venv_python: Path, specs: list[str], target: Path, log: LogFn,
+    protected_exact: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Honor the specifications in requirements.txt, with a compatibility check."""
+    managed = sorted({_canonical_dist_name(_requirement_name(item)) for item in specs})
+    inventory, constraints = _inventory_installed_environment(venv_python, managed, target, log, protected_exact)
+    if _specs_already_satisfied(venv_python, specs, inventory):
+        log("Requirements from Norm and installed plugins already satisfied; skipping pip.")
+        return {}
+    report = _pip_dry_run_report(venv_python, target, specs, constraints,
+                                 "pip-package-resolve-report.json", log, upgrade=False)
+    _check_projected_environment_compatibility(venv_python, inventory, report, target, log)
+    return _report_delta(report)
+
+
+def _resolve_newest_dependency_delta(
+    venv_python: Path,
+    specs: list[str],
+    target: Path,
+    log: LogFn,
+    protected_exact: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Upgrade the named requirements to newest mutually compatible releases."""
+    requested = _newest_requirement_names(specs)
+    inventory, constraints = _inventory_installed_environment(venv_python, requested, target, log, protected_exact)
+    log(
+        "Resolving newest mutually-compatible non-prerelease releases while preserving "
+        "requirements of older/unmanaged packages already in this venv: " + ", ".join(requested)
+    )
+    report = _pip_dry_run_report(venv_python, target, requested, constraints, "pip-resolve-report.json", log)
+    _check_projected_environment_compatibility(venv_python, inventory, report, target, log)
+    return _report_delta(report)
+
+
+def _install_dependency_delta(
+    venv_python: Path,
+    target: Path,
+    delta: dict[str, str],
+    log: LogFn,
+) -> None:
+    delta_file = _write_dependency_delta(target, delta)
+    if not delta:
+        log("Dependency delta is empty; nothing will be installed into the existing venv.")
+        return
+    log(f"Installing only {len(delta)} already-resolved distribution change(s) from {delta_file}")
+    _run(
+        [
+            str(venv_python), "-m", "pip", "install", "--disable-pip-version-check",
+            "--no-deps", "-r", str(delta_file),
+        ],
+        cwd=target,
+        log=log,
+    )
 
 
 def _external_path(settings: configparser.ConfigParser, key: str, default: str) -> Path:
@@ -1629,6 +2027,7 @@ def install_norm(
             log=log,
         )
 
+    protected_exact: dict[str, str] = {}
     if options.install_torch:
         torch_cfg = _configured_torch(settings)
         if torch_cfg:
@@ -1636,56 +2035,44 @@ def install_norm(
             installed_torch = _installed_version(venv_python, "torch", log)
             if installed_torch == version:
                 progress(38, f"PyTorch {version} already installed")
-                log(f"PyTorch {version} already satisfies the package; skipping reinstall.")
+                log(f"Protected existing CUDA PyTorch {version}; no Torch reinstall.")
             else:
-                progress(38, f"Installing PyTorch {version}")
+                progress(38, f"Installing configured CUDA PyTorch {version}")
                 cmd = [str(venv_python), "-m", "pip", "install", f"torch=={version}"]
                 if index_url:
                     cmd.extend(["--index-url", index_url])
                 _run(cmd, cwd=target, log=log)
+            protected_exact["torch"] = version
+    else:
+        installed_torch = _installed_version(venv_python, "torch", log)
+        if installed_torch:
+            protected_exact["torch"] = installed_torch
 
-    requirements = target / str(manifest["requirements_lock"])
-    dependency_mode = (options.dependency_mode or "package").strip().lower()
+    specs = _requirements_from_source(target, manifest, log)
+    dependency_mode = (options.dependency_mode or "newest").strip().lower()
     if dependency_mode == "package":
-        if _requirements_exactly_satisfied(venv_python, requirements, log):
-            progress(52, "Package requirements already satisfied")
-            log("Every package-locked distribution already matches exactly; skipping pip dependency reconciliation.")
-        else:
-            progress(52, "Installing package requirements")
-            _run(
-                [str(venv_python), "-m", "pip", "install", "--disable-pip-version-check", "-r", str(requirements)],
-                cwd=target,
-                log=log,
-            )
+        progress(52, "Checking package requirements.txt compatibility")
+        dependency_delta = _resolve_package_dependency_delta(venv_python, specs, target, log, protected_exact)
     elif dependency_mode == "newest":
-        progress(52, "Resolving newest available requirements")
-        pins = _exact_requirement_pins(requirements)
-        if not pins:
-            raise InstallerError(f"No exact package requirements were found in {requirements}")
-        requested = sorted(pins)
-        log(
-            "Newest-available mode: resolving the newest non-prerelease releases pip accepts "
-            "for the package's locked distribution set: " + ", ".join(requested)
-        )
-        _run(
-            [str(venv_python), "-m", "pip", "install", "--disable-pip-version-check", "--upgrade", *requested],
-            cwd=target,
-            log=log,
-        )
-        evidence_dir = target / "state" / "installer"
-        evidence_dir.mkdir(parents=True, exist_ok=True)
-        freeze = _run(
-            [str(venv_python), "-m", "pip", "freeze", "--all"],
-            cwd=target,
-            log=log,
-        )
-        (evidence_dir / "resolved-requirements.txt").write_text(
-            freeze.stdout if freeze.stdout.endswith("\n") else freeze.stdout + "\n",
-            encoding="utf-8",
-        )
-        log(f"Recorded resolved environment: {evidence_dir / 'resolved-requirements.txt'}")
+        progress(52, "Resolving newest mutually compatible requirements")
+        dependency_delta = _resolve_newest_dependency_delta(venv_python, specs, target, log, protected_exact)
     else:
         raise InstallerError(f"Unknown dependency mode: {options.dependency_mode!r}")
+
+    if dependency_delta:
+        progress(58, f"Installing {len(dependency_delta)} compatible dependency change(s)")
+        _install_dependency_delta(venv_python, target, dependency_delta, log)
+    else:
+        progress(58, "Python dependencies already compatible")
+        _write_dependency_delta(target, {})
+        log("Dependency delta empty: no installation into the existing venv.")
+
+    evidence_dir = _dependency_evidence_dir(target)
+    freeze = _run([str(venv_python), "-m", "pip", "freeze", "--all"], cwd=target, log=log)
+    (evidence_dir / "resolved-requirements.txt").write_text(
+        freeze.stdout if freeze.stdout.endswith("\n") else freeze.stdout + "\n", encoding="utf-8"
+    )
+    log(f"Recorded dependency environment: {evidence_dir / 'resolved-requirements.txt'}")
 
     progress(68, "Checking installed environment")
     _run([str(venv_python), "-m", "pip", "check"], cwd=target, log=log)
@@ -2596,7 +2983,7 @@ def launch_gui(initial_source: Path | None = None, imprint_path: Path | None = N
     req_box = ttk.LabelFrame(page_setup, text="Requirements", padding=12)
     req_box.grid(row=1, column=0, sticky="ew", pady=(12, 0))
     ttk.Radiobutton(
-        req_box, text="Newest available packages", variable=dependency_var, value="newest"
+        req_box, text="Newest mutually compatible packages (default)", variable=dependency_var, value="newest"
     ).grid(row=0, column=0, sticky="w")
     ttk.Label(
         req_box,
@@ -2608,7 +2995,7 @@ def launch_gui(initial_source: Path | None = None, imprint_path: Path | None = N
     ).grid(row=2, column=0, sticky="w")
     ttk.Label(
         req_box,
-        text="Install the exact tools/requirements-lock.txt shipped inside the selected Norm package.",
+        text="Keep versions specified in core/requirements.txt plus installed plugin requirements.",
         wraplength=850,
     ).grid(row=3, column=0, sticky="w", padx=(24, 0))
 
