@@ -2,7 +2,7 @@
 
 ## Build and launch from this source tree
 
-- Run `Build-Norm-Installer-EXE.bat` to compile the installer using Windows Python 3.14 and PyInstaller.
+- Run `Build-Norm-Installer-EXE.bat` to compile the installer using Windows Python 3.14 and PyInstaller. It **reuses PyInstaller's build cache** by default; add `--clean` only if a stale/corrupted cache requires a clean rebuild.
 - Run `Run-Norm-Installer.bat` to launch the compiled installer, or the Python source if no built EXE exists.
 - `Build-Installer.bat` and `Run-Installer.bat` remain equivalent short-name entry points.
 - A successful build retains `dist/Norm-Installer.exe` and stages `Norm-Installer.exe` alongside the launcher so sibling source ZIP and `Src/` discovery works.

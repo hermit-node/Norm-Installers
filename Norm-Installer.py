@@ -1440,9 +1440,9 @@ def _build_norm_candidate(target: Path, manifest: dict, venv_python: Path, log: 
         str(venv_python), "-m", "PyInstaller", "--noconfirm", "--onefile",
         "--name", "norm",
         "--paths", str(source_dir),
-        "--collect-all", "cryptography",
-        "--collect-all", "cffi",
-        "--collect-all", "pymupdf",
+        # Freeze only the modules required by norm_main's import graph.
+        # Shared runtime files, media/PDF tools and plugins remain on disk
+        # and use the installed Python venv; don't collect those whole packages.
         "--hidden-import", "_cffi_backend",
         "--version-file", str(version_file),
         "--distpath", str(build_root),

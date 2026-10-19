@@ -2,7 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib, importlib.util, json, subprocess, sys, tempfile, zipfile, os
 
-repo=Path(r'D:\LOCAL_Share\Code Projects\Norn_Installers.History.git')
+repo=Path(__file__).resolve().parents[1]
 candidate=repo/'Norm-Installer.py'
 sys.path.insert(0,str(repo))
 import py_compile
@@ -11,7 +11,7 @@ spec=importlib.util.spec_from_file_location('norm_installer_candidate',str(candi
 mod=importlib.util.module_from_spec(spec)
 sys.modules[spec.name]=mod
 spec.loader.exec_module(mod)
-assert mod.INSTALLER_VERSION=='1.6.16'
+assert mod.INSTALLER_VERSION=='1.6.17'
 
 def package(root,version='0.55.10r25'):
  root.mkdir(parents=True,exist_ok=True)

@@ -2,7 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib, importlib.util, json, subprocess, sys, tempfile, zipfile, os
 
-repo=Path(r'D:\LOCAL_Share\Code Projects\Norn_Installers.History.git')
+repo=Path(__file__).resolve().parents[1]
 candidate=repo/'Norm-Installer.py'
 sys.path.insert(0,str(repo))
 import py_compile
@@ -22,7 +22,6 @@ def package(root,version='0.55.10r25'):
     'core/main.py':'print("fixture")\n',
     'config/settings.ini':'[environment]\nvenv_path = .venv\n',
     'tools/requirements-lock.txt':'idna==3.10\n',
-    'tools/build.py':'print("build fixture")\n',
     'package-manifest.json':json.dumps(m)
  }.items():
   p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(content,encoding='utf8')
@@ -163,7 +162,22 @@ with tempfile.TemporaryDirectory(prefix='norm-builder-owned-') as t:
     finally:
         mod._run=saved
     assert candidate.is_file() and candidate.read_bytes().startswith(b'MZ')
+    assert not any((target/'tools').glob('build*.py')), 'No source build script should exist'
     assert captures and '--version-file' in captures[0]
     assert not any('build.py' in str(t) for t in captures[0])
-    print('PASS installer-owned PyInstaller command builds independent candidate',flush=True)
+    assert '--clean' not in captures[0], 'PyInstaller cache must be reused'
+    assert '--collect-all' not in captures[0], 'Do not embed entire unrelated packages'
+    assert '--paths' in captures[0], 'Runtime modules must remain importable'
+    print('PASS installer-owned minimal PyInstaller command builds independent candidate',flush=True)
+# The 1.6.17 installer must never require source-controlled build tooling.
+with tempfile.TemporaryDirectory(prefix='norm-installer-plugin-preserve-') as t:
+    root=Path(t)
+    source=root/'source'; (source/'core').mkdir(parents=True)
+    (source/'core'/'norm_main.py').write_text('print("entrypoint")\n',encoding='utf8')
+    target=root/'target'; existing=target/'plugins'/'operator'
+    existing.mkdir(parents=True)
+    (existing/'plugin.json').write_text('{"name":"operator"}',encoding='utf8')
+    mod._sync_tree_contents(source,target,protected={'plugins'},log=lambda _:None)
+    assert (existing/'plugin.json').read_text(encoding='utf8')=='{"name":"operator"}'
+    print('PASS persistent operator plugin survives source mirror',flush=True)
 print('ALL_1_6_17_BUILDER_RESTORATION_TESTS_PASSED',flush=True)

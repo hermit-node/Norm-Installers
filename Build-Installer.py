@@ -12,8 +12,13 @@ def sha256(p: Path)->str:
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--verify-reference',action='store_true')
+    ap.add_argument('--clean',action='store_true',help='Explicitly discard the PyInstaller build cache')
     args=ap.parse_args()
-    subprocess.run([sys.executable,'-m','PyInstaller','--clean','--noconfirm',str(SPEC)],cwd=ROOT,check=True)
+    command=[sys.executable,'-m','PyInstaller','--noconfirm']
+    if args.clean:
+        command.append('--clean')
+    command.append(str(SPEC))
+    subprocess.run(command,cwd=ROOT,check=True)
     exe=ROOT/'dist'/'Norm-Installer.exe'
     if not exe.is_file(): raise SystemExit('Build completed but dist/Norm-Installer.exe is missing')
     digest=sha256(exe)

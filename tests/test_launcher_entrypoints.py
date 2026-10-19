@@ -28,20 +28,28 @@ with tempfile.TemporaryDirectory(prefix="norm-installer-launcher-") as td:
     (root / "Norm-Installer.spec").write_text("test fixture", encoding="utf-8")
     payload = b"MZ dummy executable bytes"
 
+    seen=[]
     def fake_pyinstaller(args, *, cwd, check):
-        assert args[1:5] == ["-m", "PyInstaller", "--clean", "--noconfirm"]
+        assert args[1:4] == ["-m", "PyInstaller", "--noconfirm"]
+        assert args[-1] == str(root / "Norm-Installer.spec")
+        seen.append(args)
         assert cwd == root and check
         output = root / "dist" / "Norm-Installer.exe"
-        output.parent.mkdir(parents=True)
+        output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(payload)
         return subprocess.CompletedProcess(args=args, returncode=0)
 
     with patch.object(mod, "ROOT", root), patch.object(mod, "SPEC", root / "Norm-Installer.spec"),          patch.object(mod.subprocess, "run", side_effect=fake_pyinstaller),          patch.object(sys, "argv", ["Build-Installer.py"]):
         mod.main()
 
+    assert len(seen) == 1 and "--clean" not in seen[0]
     assert (root / "Norm-Installer.exe").read_bytes() == payload
     assert (root / "dist" / "Norm-Installer.exe").read_bytes() == payload
     assert not (root / "Norm-Installer.exe.staging").exists()
+
+    with patch.object(mod, "ROOT", root), patch.object(mod, "SPEC", root / "Norm-Installer.spec"),          patch.object(mod.subprocess, "run", side_effect=fake_pyinstaller),          patch.object(sys, "argv", ["Build-Installer.py", "--clean"]):
+        mod.main()
+    assert len(seen) == 2 and "--clean" in seen[1]
 
 print("PASS installer BAT compatibility, automatic source selection, ignored artifacts")
 print("PASS single-build candidate published beside launcher, with matching hashes")
