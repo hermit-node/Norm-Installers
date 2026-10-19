@@ -1,0 +1,2 @@
+# Normalized Git storage; native Windows batch line endings
+*.bat text eol=crlf

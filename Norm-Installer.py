@@ -561,14 +561,13 @@ def inspect_package(source_zip: Path) -> PackageInfo:
         "entrypoint",
         "settings",
         "requirements_lock",
-        "build_script",
     )
     missing = [key for key in required_keys if not str(manifest.get(key, "")).strip()]
     if missing:
         raise InstallerError(f"Manifest missing required field(s): {', '.join(missing)}")
 
     root = PurePosixPath(manifest_member).parent
-    for key in ("entrypoint", "settings", "requirements_lock", "build_script"):
+    for key in ("entrypoint", "settings", "requirements_lock"):
         rel = _source_relative_path(str(manifest[key]))
         if is_folder:
             candidate = source_zip / rel
@@ -1339,6 +1338,129 @@ def _ingest_operator_plugins(
             log(f"  WARNING: {exc}")
 
 
+def _windows_version_tuple(value: str) -> tuple[int, int, int, int]:
+    """Map Norm release labels to stable Windows 4-part version metadata.
+
+    Accepted examples include 0.54.2, 0.54.2g, 0.54.2g2, 0.54.2-beta2,
+    0.54.2beta2, 0.54.2-b2, 0.54.2b2, 0.54.2-rc1, and 0.54.2rc1.
+    Plain single-letter suffixes preserve the historical a=1, b=2, ... mapping.
+    A letter plus an iteration uses a collision-free 100-based bucket (b2 -> 202),
+    matching the named beta2 bucket without changing the meaning of a plain 'b'.
+    """
+    text = value.strip()
+    # Newer Norm packages include r25 and optional descriptive suffixes.
+    release = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)r(\d+)(?:[-_.].*)?", text, re.IGNORECASE)
+    if release:
+        major, minor, patch, revision = (int(part) for part in release.groups())
+        if revision > 65535:
+            raise InstallerError(f"Norm release revision exceeds Windows version limits: {value!r}")
+        return major, minor, patch, revision
+    match = re.fullmatch(
+        r"(\d+)\.(\d+)\.(\d+)(?:[-_.]?(?:(alpha|beta|rc)(\d*)|([a-zA-Z])(\d*)))?",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        raise InstallerError(f"Unsupported Norm version for Windows metadata: {value!r}")
+
+    major, minor, patch = (int(match.group(i)) for i in (1, 2, 3))
+    named = (match.group(4) or "").lower()
+    named_iteration = match.group(5) or ""
+    letter = (match.group(6) or "").lower()
+    letter_iteration = match.group(7) or ""
+
+    if named:
+        base = {"alpha": 100, "beta": 200, "rc": 300}[named]
+        revision = base + max(1, int(named_iteration or "1"))
+    elif letter:
+        ordinal = ord(letter) - ord("a") + 1
+        if letter_iteration:
+            revision = ordinal * 100 + int(letter_iteration)
+        else:
+            revision = ordinal
+    else:
+        revision = 0
+
+    if not 0 <= revision <= 65535:
+        raise InstallerError(f"Norm version revision exceeds Windows version limits: {value!r}")
+    return major, minor, patch, revision
+
+
+def _write_norm_version_resource(target: Path, manifest: dict, version_file: Path) -> None:
+    settings = _read_settings(target, manifest)
+    meta = {
+        key: settings.get("project", key, fallback="").strip()
+        for key in ("name", "version", "author", "repository")
+    }
+    # The selected package manifest defines this build's executable version.
+    meta["version"] = str(manifest.get("version") or meta["version"]).strip()
+    if not all(meta.values()):
+        raise InstallerError(f"Incomplete [project] metadata for norm.exe build: {meta}")
+    nums = _windows_version_tuple(meta["version"])
+    version_file.write_text(
+        f"""VSVersionInfo(
+  ffi=FixedFileInfo(filevers={nums}, prodvers={nums}, mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([StringTable('040904B0', [
+      StringStruct('CompanyName', {meta['author']!r}),
+      StringStruct('FileDescription', {meta['name']!r}),
+      StringStruct('FileVersion', {meta['version']!r}),
+      StringStruct('InternalName', 'norm'),
+      StringStruct('OriginalFilename', 'norm.exe'),
+      StringStruct('ProductName', {meta['name']!r}),
+      StringStruct('ProductVersion', {meta['version']!r}),
+      StringStruct('Comments', {meta['repository']!r}),
+    ])]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
+""",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+
+def _build_norm_candidate(target: Path, manifest: dict, venv_python: Path, log: LogFn) -> Path:
+    """Build one norm.exe candidate using the already-selected runtime venv."""
+    source_dir = target / str(manifest.get("source_dir", "core"))
+    entrypoint = target / str(manifest["entrypoint"])
+    if not entrypoint.is_file():
+        raise InstallerError(f"Installed Norm entrypoint is missing: {entrypoint}")
+
+    build_root = target / "staging" / "installer-norm-build"
+    shutil.rmtree(build_root, ignore_errors=True)
+    work_dir = target / "state" / "build-cache" / "pyinstaller" / "work"
+    spec_dir = target / "state" / "build-cache" / "pyinstaller" / "spec"
+    for directory in (build_root, work_dir, spec_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    version_file = build_root / "version_info.txt"
+    _write_norm_version_resource(target, manifest, version_file)
+    cmd = [
+        str(venv_python), "-m", "PyInstaller", "--noconfirm", "--onefile",
+        "--name", "norm",
+        "--paths", str(source_dir),
+        # Freeze only the modules required by norm_main's import graph.
+        # Shared runtime files, media/PDF tools and plugins remain on disk
+        # and use the installed Python venv; don't collect those whole packages.
+        "--hidden-import", "_cffi_backend",
+        "--version-file", str(version_file),
+        "--distpath", str(build_root),
+        "--workpath", str(work_dir),
+        "--specpath", str(spec_dir),
+        str(entrypoint),
+    ]
+    _run(cmd, cwd=target, log=log)
+    candidate = build_root / ("norm.exe" if os.name == "nt" else "norm")
+    if not candidate.is_file() or candidate.stat().st_size == 0:
+        raise InstallerError(f"PyInstaller build did not produce {candidate}")
+    if os.name == "nt":
+        with candidate.open("rb") as handle:
+            if handle.read(2) != b"MZ":
+                raise InstallerError(f"Built candidate is not a Windows executable: {candidate}")
+    return candidate
+
+
 def install_norm(
     options: InstallOptions,
     *,
@@ -1589,22 +1711,26 @@ def install_norm(
         compiled_rel = str(manifest.get("compiled_executable", "core/norm.exe"))
         compiled = target / compiled_rel
         compiled.parent.mkdir(parents=True, exist_ok=True)
-        progress(76, "Compiling norm.exe")
-        build_script = target / str(manifest["build_script"])
-        _run(
-            [str(venv_python), str(build_script), "--candidate", str(compiled)],
-            cwd=target,
-            log=log,
-        )
-        if not compiled.is_file() or compiled.stat().st_size == 0:
-            raise InstallerError(f"Build completed without producing {compiled}")
-        if os.name == "nt":
-            with compiled.open("rb") as handle:
-                if handle.read(2) != b"MZ":
-                    raise InstallerError(f"Compiled file does not look like a Windows executable: {compiled}")
-        # The package build script uses staging as disposable PyInstaller work
-        # space. A successful install keeps only the requested executable.
-        shutil.rmtree(target / "staging", ignore_errors=True)
+        progress(76, "Compiling norm.exe using installer-owned build")
+        candidate = _build_norm_candidate(target, manifest, venv_python, log)
+        pending = compiled.with_name(compiled.stem + ".new" + compiled.suffix)
+        pending.unlink(missing_ok=True)
+        shutil.copy2(candidate, pending)
+        try:
+            version_check = _run([str(pending), "--version"], cwd=target, log=log)
+            expected_version = str(manifest.get("version") or "").strip()
+            if expected_version and expected_version not in (version_check.stdout or ""):
+                raise InstallerError(
+                    f"Candidate norm.exe did not report {expected_version!r}: "
+                    f"{(version_check.stdout or '').strip()!r}"
+                )
+            candidate_sha = _sha256(pending)
+            os.replace(pending, compiled)
+            log(f"Installed norm.exe validated and promoted: sha256={candidate_sha}")
+        finally:
+            pending.unlink(missing_ok=True)
+        # Keep PyInstaller work/spec cache reusable; only remove disposable candidate.
+        shutil.rmtree(target / "staging" / "installer-norm-build", ignore_errors=True)
 
     progress(92, "Creating runtime directories")
     _post_install_workspace(settings, target, warnings, log)
@@ -3236,8 +3362,7 @@ def main() -> int:
             "package_schema": info.manifest.get("package_schema"),
             "entrypoint": info.manifest.get("entrypoint"),
             "requirements_lock": info.manifest.get("requirements_lock"),
-            "build_script": info.manifest.get("build_script"),
-        }, indent=2))
+            }, indent=2))
         return 0
 
     if args.install:

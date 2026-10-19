@@ -2,7 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib, importlib.util, json, subprocess, sys, tempfile, zipfile, os
 
-repo=Path(r'D:\LOCAL_Share\Code Projects\Norn_Installers.History.git')
+repo=Path(__file__).resolve().parents[1]
 candidate=repo/'Norm-Installer.py'
 sys.path.insert(0,str(repo))
 import py_compile
@@ -17,12 +17,11 @@ def package(root,version='0.55.10r25'):
  root.mkdir(parents=True,exist_ok=True)
  m={'package_schema':1,'package_type':'portable-source','name':'Norm','version':version,
     'entrypoint':'core/main.py','settings':'config/settings.ini',
-    'requirements_lock':'tools/requirements-lock.txt','build_script':'tools/build.py'}
+    'requirements_lock':'tools/requirements-lock.txt'}
  for rel,content in {
     'core/main.py':'print("fixture")\n',
     'config/settings.ini':'[environment]\nvenv_path = .venv\n',
     'tools/requirements-lock.txt':'idna==3.10\n',
-    'tools/build.py':'print("build fixture")\n',
     'package-manifest.json':json.dumps(m)
  }.items():
   p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(content,encoding='utf8')

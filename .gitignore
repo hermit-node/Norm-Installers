@@ -1,0 +1,7 @@
+# Generated Python and installer build output
+__pycache__/
+*.py[cod]
+build/
+dist/
+Norm-Installer.exe
+Norm-Installer.exe.staging
