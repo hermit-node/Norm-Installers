@@ -1185,31 +1185,44 @@ def _newest_requirement_names(specs: list[str]) -> list[str]:
 
 
 def _specs_already_satisfied(venv_python: Path, specs: list[str], inventory: dict[str, Any]) -> bool:
-    # Evaluate PEP 508 requirements using packaging from the selected venv.
-    # Extras are resolved with pip rather than guessed from package-name presence.
+    """One interpreter call checks direct requirements and declared extras."""
     installed = {name: str(row.get("version") or "") for name, row in (inventory.get("records") or {}).items()}
-    code = r"""import json,sys,re
+    code = r"""import json, sys, re, importlib.metadata as md
 try:
  from packaging.requirements import Requirement
  from packaging.markers import default_environment
 except ImportError:
  from pip._vendor.packaging.requirements import Requirement
  from pip._vendor.packaging.markers import default_environment
-data=json.loads(sys.argv[1]); installed=data["installed"]
-for raw in data["specs"]:
+payload=json.loads(sys.argv[1]); installed=payload["installed"]
+def canon(s): return re.sub(r"[-_.]+","-",s).lower()
+def compatible(raw, env):
  req=Requirement(raw)
- if req.marker is not None and not req.marker.evaluate(default_environment()):
-  continue
- key=re.sub(r"[-_.]+","-",req.name).lower()
- ver=installed.get(key)
- if not ver or req.extras or (req.specifier and not req.specifier.contains(ver,prereleases=True)):
+ if req.marker is not None and not req.marker.evaluate(env): return True
+ v=installed.get(canon(req.name))
+ return bool(v and (not req.specifier or req.specifier.contains(v,prereleases=True)))
+for raw in payload["specs"]:
+ req=Requirement(raw)
+ env=default_environment();env["extra"]=""
+ if not compatible(raw,env):
+  print("no");break
+ extras_ok=True
+ for extra in req.extras:
+  env=default_environment();env["extra"]=extra
+  try: nested=md.requires(req.name) or []
+  except md.PackageNotFoundError: nested=[]
+  if not all(compatible(dep,env) for dep in nested):
+   extras_ok=False;break
+ if not extras_ok:
   print("no");break
 else:
  print("yes")
 """
-    cp = subprocess.run([str(venv_python), "-c", code, json.dumps({"specs": specs, "installed": installed})],
-                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
+    cp = subprocess.run(
+        [str(venv_python), "-c", code, json.dumps({"specs": specs, "installed": installed})],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+    )
     return cp.returncode == 0 and cp.stdout.strip() == "yes"
 
 
@@ -1496,7 +1509,9 @@ def _resolve_newest_dependency_delta(
 ) -> dict[str, str]:
     """Upgrade the named requirements to newest mutually compatible releases."""
     requested = _newest_requirement_names(specs)
-    inventory, constraints = _inventory_installed_environment(venv_python, requested, target, log, protected_exact)
+    inventory, constraints = _inventory_installed_environment(
+        venv_python, [_requirement_name(item) for item in requested], target, log, protected_exact
+    )
     log(
         "Resolving newest mutually-compatible non-prerelease releases while preserving "
         "requirements of older/unmanaged packages already in this venv: " + ", ".join(requested)
