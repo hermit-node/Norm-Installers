@@ -11,7 +11,7 @@ spec=importlib.util.spec_from_file_location('norm_installer_candidate',str(candi
 mod=importlib.util.module_from_spec(spec)
 sys.modules[spec.name]=mod
 spec.loader.exec_module(mod)
-assert mod.INSTALLER_VERSION=='1.6.17'
+# This regression test is release-independent.
 
 def package(root,version='0.55.10r25'):
  root.mkdir(parents=True,exist_ok=True)

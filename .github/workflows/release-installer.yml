@@ -1,0 +1,63 @@
+name: Publish Norm Installer
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Select Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install compiler
+        run: python -m pip install --disable-pip-version-check 'pyinstaller==6.22.3'
+      - name: Test installer
+        env:
+          NORM_EXPECTED_RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python -m unittest discover -s tests -p 'test_*.py'
+          python tests/test_installer_owned_build_1_6_17.py
+          python tests/test_launcher_entrypoints.py
+      - name: Compile installer
+        run: python Build-Installer.py
+      - name: Smoke test Windows executable
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD "Norm-Installer.exe"
+          $marker = Join-Path $env:RUNNER_TEMP "norm-installer-smoke.txt"
+          $process = Start-Process -FilePath $exe -ArgumentList @("--self-test-file", $marker) -Wait -PassThru
+          if ($process.ExitCode -ne 0 -or -not (Test-Path $marker)) { throw "Compiled installer self-test failed" }
+          $expected = "ok $($env:GITHUB_REF_NAME.Substring(1)) auto-source"
+          if ((Get-Content $marker -Raw).Trim() -ne $expected) { throw "Wrong installer version in executable" }
+          if (Test-Path (Join-Path $PWD "dist/Norm-Installer.exe")) { throw "Duplicate dist EXE" }
+      - name: Package buildable source and checksums
+        shell: pwsh
+        run: python tools/package_release.py --output $env:RUNNER_TEMP
+      - name: Publish GitHub Release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $version = $tag.Substring(1)
+          $source = Join-Path $env:RUNNER_TEMP "Norm-Installer-$version-source.zip"
+          $checksums = Join-Path $env:RUNNER_TEMP "SHA256SUMS.txt"
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag "Norm-Installer.exe" $source $checksums --clobber --repo $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $tag "Norm-Installer.exe" $source $checksums --verify-tag --latest --title "Norm Installer $version" --notes-file RELEASE_NOTES.md --repo $env:GITHUB_REPOSITORY
+          }
+          if ($LASTEXITCODE -ne 0) { throw "GitHub Release creation/upload failed" }
+          gh release view $tag --repo $env:GITHUB_REPOSITORY --json tagName,assets

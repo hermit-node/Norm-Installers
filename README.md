@@ -1,4 +1,24 @@
-# Norm Installer 1.6.17
+# Norm Installer 1.7.0
+
+## 1.7.0 public release (2026-10-19)
+
+This release promotes the cumulative 1.6.17 fixes to the public installer:
+- Explicit new settings and existing operator customizations survive upgrades.
+- Dependency policy defaults to newest mutually compatible distributions,
+  with an alternate exact/source-requirements mode.
+- Installed plugin dependencies are collected, including Vision Parse
+  OpenCV / ONNX Runtime packages; configured CUDA PyTorch is protected.
+- Norm's own core EXE is built by the installer with lean import collection,
+  persistent runtime build cache, candidate validation, and atomic promotion.
+- The INSTALLER itself builds one portable Norm-Installer.exe beside its BATs.
+  Installer PyInstaller work is disposable and removed on success or failure.
+- A portable Norm source ZIP or source folder is selected independently,
+  and is NOT embedded into the installer executable.
+
+Build: Build-Installer.bat
+Launch: Run-Installer.bat (or run Norm-Installer.exe directly)
+Source ZIPs and any operator plugins stay next to the installer EXE or are
+selected in the GUI. Never include machine-specific secrets in public packages.
 
 ## 1.6.17 compatibility repair (2026-10-19)
 

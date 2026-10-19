@@ -3,7 +3,7 @@ import argparse, hashlib, os, subprocess, sys, tempfile
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent
 SPEC=ROOT/'Norm-Installer.spec'
-EXPECTED='AB3BEF2CBCBEB94499FE1D62B410C1A7D609DAC12D2E1014C7EB008423B4E96A'
+EXPECTED='302164378A25DCB166299D3897DB76E90BFD28BD969224179D254C4D268B5E7D'
 def sha256(p: Path)->str:
     h=hashlib.sha256()
     with p.open('rb') as f:
