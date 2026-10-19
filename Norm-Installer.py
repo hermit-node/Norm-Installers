@@ -555,19 +555,13 @@ def inspect_package(source_zip: Path) -> PackageInfo:
     if package_type == "full-backup" and not str(manifest.get("backup_payload") or "").strip():
         raise InstallerError("full-backup package is missing backup_payload")
 
-    required_keys = (
-        "name",
-        "version",
-        "entrypoint",
-        "settings",
-        "requirements_lock",
-    )
+    required_keys = ("name", "version", "entrypoint", "settings")
     missing = [key for key in required_keys if not str(manifest.get(key, "")).strip()]
     if missing:
         raise InstallerError(f"Manifest missing required field(s): {', '.join(missing)}")
 
     root = PurePosixPath(manifest_member).parent
-    for key in ("entrypoint", "settings", "requirements_lock"):
+    for key in ("entrypoint", "settings"):
         rel = _source_relative_path(str(manifest[key]))
         if is_folder:
             candidate = source_zip / rel
@@ -579,6 +573,29 @@ def inspect_package(source_zip: Path) -> PackageInfo:
                 member = str(root / PurePosixPath(*rel.parts))
                 if member not in set(zf.namelist()):
                     raise InstallerError(f"Package is missing {key}: {manifest[key]}")
+
+    # Prefer a normal source requirements.txt; retained lock manifests only
+    # support older packages that did not ship requirements.txt.
+    req_candidates = [
+        str(manifest.get("requirements") or ""),
+        f'{manifest.get("source_dir", "core")}/requirements.txt',
+        str(manifest.get("requirements_lock") or ""),
+    ]
+    found_requirements = False
+    for candidate_rel in req_candidates:
+        if not candidate_rel.strip():
+            continue
+        rel = _source_relative_path(candidate_rel)
+        if is_folder:
+            present = (source_zip / rel).is_file() and not (source_zip / rel).is_symlink()
+        else:
+            with zipfile.ZipFile(source_zip, "r") as zf:
+                present = str(root / PurePosixPath(*rel.parts)) in zf.namelist()
+        if present:
+            found_requirements = True
+            break
+    if not found_requirements:
+        raise InstallerError("Package is missing core/requirements.txt (or legacy requirements_lock).")
 
     return PackageInfo(
         source_zip=source_zip,
@@ -1094,10 +1111,12 @@ def _installed_version(python_exe: Path, distribution: str, log: LogFn) -> str |
 def _requirements_from_source(target: Path, manifest: dict, log: LogFn) -> list[str]:
     """Use the source requirements.txt; add requirements from installed plugin folders."""
     source_dir = target / str(manifest.get("source_dir", "core"))
-    requirements = source_dir / "requirements.txt"
+    requirements = target / str(manifest.get("requirements") or (source_dir / "requirements.txt").relative_to(target))
     if not requirements.is_file():
         # Backward-compatible input for old Norm source ZIPs without requirements.txt.
-        requirements = target / str(manifest["requirements_lock"])
+        requirements = target / str(manifest.get("requirements_lock") or "")
+        if not requirements.is_file():
+            raise InstallerError("Package does not provide a usable requirements.txt.")
         log(f"Legacy package has no core/requirements.txt; using {requirements.name}.")
     sources = [requirements]
     plugin_root = target / "plugins"
@@ -1158,8 +1177,6 @@ def _newest_requirement_names(specs: list[str]) -> list[str]:
 def _specs_already_satisfied(venv_python: Path, specs: list[str], inventory: dict[str, Any]) -> bool:
     # Evaluate PEP 508 requirements using packaging from the selected venv.
     # Extras are resolved with pip rather than guessed from package-name presence.
-    path = _dependency_evidence_dir  # Referenced only to avoid rebuilding the inventory.
-    del path
     installed = {name: str(row.get("version") or "") for name, row in (inventory.get("records") or {}).items()}
     code = r"""import json,sys,re
 try:
@@ -2656,15 +2673,26 @@ def _normalized_requirements_text(text: str) -> str:
 
 def _source_requirements_text(source_zip: Path) -> str:
     info = inspect_package(source_zip)
-    rel = _source_relative_path(str(info.manifest.get("requirements_lock") or ""))
+    choices = [
+        info.manifest.get("requirements") or "",
+        f'{info.manifest.get("source_dir", "core")}/requirements.txt',
+        info.manifest.get("requirements_lock") or "",
+    ]
     if info.source_zip.is_dir():
-        return (info.source_zip / rel).read_text(encoding="utf-8-sig")
-    member = str(info.zip_root / PurePosixPath(*rel.parts))
-    with zipfile.ZipFile(info.source_zip, "r") as zf:
-        try:
-            return zf.read(member).decode("utf-8-sig")
-        except KeyError as exc:
-            raise InstallerError(f"Selected source package is missing {rel}") from exc
+        for raw in choices:
+            if raw and (info.source_zip / _source_relative_path(str(raw))).is_file():
+                return (info.source_zip / _source_relative_path(str(raw))).read_text(encoding="utf-8-sig")
+    else:
+        with zipfile.ZipFile(info.source_zip, "r") as zf:
+            names = set(zf.namelist())
+            for raw in choices:
+                if not raw:
+                    continue
+                rel = _source_relative_path(str(raw))
+                member = str(info.zip_root / PurePosixPath(*rel.parts))
+                if member in names:
+                    return zf.read(member).decode("utf-8-sig")
+    raise InstallerError("Selected source package is missing requirements.txt")
 
 
 def compare_companion_requirements(source_zip: Path) -> tuple[bool, str]:
