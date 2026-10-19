@@ -115,5 +115,37 @@ class RequirementRepairTests(unittest.TestCase):
             self.assertEqual(out["install"], [])
 
 
+    def test_vision_parse_import_check_warns_when_cuda_not_advertised(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            plugin = root / "plugins" / "vision_parse"
+            plugin.mkdir(parents=True)
+            (plugin / "plugin.json").write_text("{}", encoding="utf-8")
+            warnings = []
+            output = mock.Mock(returncode=0, stdout=json.dumps({
+                "opencv": "5.0.0", "onnxruntime_providers": ["CPUExecutionProvider"]
+            }), stderr="")
+            with mock.patch.object(installer.subprocess, "run", return_value=output) as run:
+                installer._verify_vision_parse_dependencies(
+                    Path("python"), root, lambda _: None, warnings
+                )
+                self.assertTrue(run.called)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("CUDA provider", warnings[0])
+
+    def test_vision_parse_import_check_rejects_missing_packages(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            plugin = root / "plugins" / "vision_parse"
+            plugin.mkdir(parents=True)
+            (plugin / "plugin.json").write_text("{}", encoding="utf-8")
+            output = mock.Mock(returncode=1, stdout="", stderr="ModuleNotFoundError: No module named 'cv2'")
+            with mock.patch.object(installer.subprocess, "run", return_value=output):
+                with self.assertRaises(installer.InstallerError):
+                    installer._verify_vision_parse_dependencies(
+                        Path("python"), root, lambda _: None, []
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()
