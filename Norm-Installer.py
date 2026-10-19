@@ -1142,14 +1142,24 @@ def _requirements_from_source(target: Path, manifest: dict, log: LogFn) -> list[
     # The compiler is installer infrastructure and is required for fresh installs.
     if "pyinstaller" not in declared:
         specs.append("PyInstaller>=6")
-    # Older Vision Parse packages did not ship their own requirements.txt.
-    # Supply only absent declarations; core/requirements.txt pins still take precedence.
-    if (plugin_root / "vision_parse" / "plugin.json").is_file():
-        for name in ("opencv-python", "onnxruntime-gpu", "imageio-ffmpeg",
-                     "numpy", "pillow", "pytesseract", "PyMuPDF"):
-            if _canonical_dist_name(name) not in declared:
+    # Earlier plugin releases did not ship requirements.txt sidecars.
+    # Include their known runtime wheels until all deployed packages declare them.
+    # Never override an explicit version constraint from core or a plugin.
+    legacy_plugin_requirements = {
+        "vision_parse": ("opencv-python", "onnxruntime-gpu", "imageio-ffmpeg",
+                         "numpy", "pillow", "pytesseract", "PyMuPDF"),
+        "desktop_gui": ("pywinauto", "mss", "pywin32", "comtypes"),
+        "shared_browser": ("PySide6", "reportlab", "mss", "Pillow", "playwright"),
+        "norm_browser": ("PySide6", "reportlab", "mss", "playwright"),
+    }
+    for plugin_name, needed in legacy_plugin_requirements.items():
+        if not (plugin_root / plugin_name / "plugin.json").is_file():
+            continue
+        for name in needed:
+            canonical = _canonical_dist_name(name)
+            if canonical not in declared:
                 specs.append(name)
-                declared.add(_canonical_dist_name(name))
+                declared.add(canonical)
     log(f"Collected {len(specs)} dependency declarations from {len(sources)} requirements.txt file(s), including installed plugins.")
     return specs
 
