@@ -21,7 +21,7 @@ from typing import Any, Callable, Iterable
 
 import installer_environment as envtools
 
-INSTALLER_VERSION = "1.7.0"
+INSTALLER_VERSION = "1.7.1"
 PIP_VERSION = "26.2.1"
 PIP_MIN_VERSION = PIP_VERSION  # backward-compatible internal print helper
 PIP_SPEC = f"pip=={PIP_VERSION}"
@@ -1542,6 +1542,61 @@ def _install_dependency_delta(
     )
 
 
+def _ensure_vision_parse_models(
+    venv_python: Path, target: Path, log: LogFn,
+) -> None:
+    """During installation, reuse or fetch SHA-256-pinned OpenCV face models."""
+    module = target / "plugins" / "vision_parse" / "src" / "media_faces.py"
+    if not module.is_file():
+        log("Vision Parse face-model downloader absent in legacy source; skipping.")
+        return
+    code = """import json
+from plugins.vision_parse.src.media_faces import models_status, setup_models, model_root
+import cv2
+before = models_status()
+if before.get('ready'):
+    action = 'reused'
+else:
+    setup_models(approved=True)
+    action = 'downloaded'
+after = models_status()
+if not after.get('ready'):
+    raise RuntimeError('OpenCV model files are not SHA-256 verified')
+root = model_root()
+detector = cv2.FaceDetectorYN.create(str(root / 'face_detection_yunet_2023mar.onnx'), '', (320, 320))
+recognizer = cv2.FaceRecognizerSF.create(str(root / 'face_recognition_sface_2021dec.onnx'), '')
+if detector is None or recognizer is None:
+    raise RuntimeError('OpenCV failed to load the CPU face models')
+print(json.dumps({'status': action, 'cpu_ready': True}))
+"""
+    try:
+        cp = subprocess.run(
+            [str(venv_python), "-B", "-c", code], cwd=target,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=240,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+        )
+    except Exception as exc:
+        raise InstallerError(
+            "Vision Parse model setup failed. Supply verified YuNet/SFace "
+            "in plugins/vision_parse/models or reconnect and retry. " + str(exc)
+        ) from exc
+    if cp.returncode:
+        raise InstallerError(
+            "Vision Parse YuNet/SFace models could not be downloaded, verified "
+            "and loaded on CPU. Supply official model files in "
+            "plugins/vision_parse/models or retry online: "
+            + (cp.stderr or cp.stdout or "unknown error").strip()[-1500:]
+        )
+    try:
+        result = json.loads(cp.stdout.strip())
+        if result.get("cpu_ready") is not True or result.get("status") not in {"reused", "downloaded"}:
+            raise ValueError("incomplete model status")
+    except Exception as exc:
+        raise InstallerError("Vision Parse CPU model check returned unexpected output") from exc
+    log(f"Vision Parse weights verified ({result['status']}); OpenCV CPU models loaded.")
+
+
 def _verify_vision_parse_dependencies(
     venv_python: Path, target: Path, log: LogFn, warnings: list[str]
 ) -> None:
@@ -2167,6 +2222,8 @@ def install_norm(
     progress(68, "Checking installed environment")
     _run([str(venv_python), "-m", "pip", "check"], cwd=target, log=log)
     _verify_vision_parse_dependencies(venv_python, target, log, warnings)
+    progress(69, "Hydrating verified Vision Parse CPU models")
+    _ensure_vision_parse_models(venv_python, target, log)
     source_dir = target / str(manifest.get("source_dir", "core"))
     tools_dir = target / "tools"
     _run(

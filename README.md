@@ -1,8 +1,14 @@
-# Norm Installer 1.7.0
+# Norm Installer 1.7.1
 
-## 1.7.0 public release (2026-10-19)
+## 1.7.1 public release (2026-10-19)
 
-This release promotes the cumulative 1.6.17 fixes to the public installer:
+This release adds automatic verified Vision Parse face-model downloads: installer
+fetches YuNet and SFace only when absent, checks pinned SHA-256 values,
+loads them on OpenCV CPU, and keeps them in persistent plugins.
+Offline installation requires verified existing model files; failures are
+reported clearly. The Norm source ZIP does not bundle the large weights.
+
+This release also includes the cumulative 1.6.17 fixes:
 - Explicit new settings and existing operator customizations survive upgrades.
 - Dependency policy defaults to newest mutually compatible distributions,
   with an alternate exact/source-requirements mode.
